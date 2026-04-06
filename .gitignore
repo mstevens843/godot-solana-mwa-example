@@ -1,0 +1,21 @@
+# Godot build artifacts
+android/build/
+android/.gradle/
+*.apk
+*.aab
+*.aar
+
+# Godot editor
+.godot/
+*.import
+
+# OS files
+.DS_Store
+*.rtf
+
+# Addons binaries (large native libs — users download from SDK releases)
+addons/SolanaSDK/bin/*.framework
+addons/SolanaSDK/bin/*.so
+addons/SolanaSDK/bin/*.dll
+addons/SolanaSDK/bin/*.dylib
+addons/SolanaSDK/bin/*.wasm
