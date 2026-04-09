@@ -27,6 +27,8 @@ func _ready() -> void:
 	var cached = MWAManager.cache.get_latest_auth()
 	var has_cached := cached != null
 	reconnect_button.visible = has_cached
+	if has_cached:
+		AndroidToastHelper.show("Cached session found: %s..." % str(cached.get("pubkey", "")).substr(0, 8))
 	print("%s _ready | DONE cached_auth=%s reconnect_visible=%s" % [TAG, str(has_cached), str(has_cached)])
 
 

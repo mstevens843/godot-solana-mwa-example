@@ -183,12 +183,14 @@ func authorize() -> bool:
 		connected_pubkey = _extract_pubkey_string(raw_key)
 		_is_connected = true
 		print("%s authorize | CONNECTED pubkey=%s elapsed=%.1fs — now signing to confirm" % [TAG, connected_pubkey, elapsed])
+		AndroidToastHelper.show("Authorized: %s" % _truncate_pubkey(connected_pubkey))
 
 		# Auto sign message to complete auth (Seed Vault biometric confirmation)
 		status_updated.emit("Confirming identity...")
 		var sign_in_sig = await sign_message("Sign in to %s" % AppConfig.APP_NAME)
 		if sign_in_sig.is_empty():
 			print("%s authorize | FAIL sign-in signature rejected or timed out" % TAG)
+			AndroidToastHelper.show("Sign-in rejected")
 			_is_connected = false
 			connected_pubkey = ""
 			status_updated.emit("Sign-in cancelled")
@@ -196,9 +198,11 @@ func authorize() -> bool:
 			return false
 
 		print("%s authorize | SIGNED sig=%s — auth complete" % [TAG, sign_in_sig.substr(0, 20)])
+		AndroidToastHelper.show("Biometric sign-in verified")
 
 		# Cache auth
 		cache.set_auth(connected_pubkey, auth_token, wallet_uri_base)
+		AndroidToastHelper.show("Auth cached for %s..." % connected_pubkey.substr(0, 8))
 		print("%s authorize | cached auth pubkey=%s auth_token_len=%d" % [TAG, connected_pubkey, auth_token.length()])
 
 		status_updated.emit("Connected: " + _truncate_pubkey(connected_pubkey))
@@ -232,6 +236,7 @@ func reauthorize() -> bool:
 	# TODO: Use SDK's native reauthorize when available
 	# For now, full re-auth
 	print("%s reauthorize | falling back to full authorize()" % TAG)
+	AndroidToastHelper.show("Reauthorizing with cached token...")
 	return await authorize()
 
 
@@ -256,6 +261,7 @@ func deauthorize() -> void:
 	_last_signature = ""
 
 	print("%s deauthorize | DONE old_pubkey=%s state_cleared=true" % [TAG, old_pubkey])
+	AndroidToastHelper.show("Wallet disconnected")
 	status_updated.emit("Disconnected")
 	disconnected.emit()
 
@@ -285,6 +291,7 @@ func sign_message(message: String) -> String:
 
 	if _signing_completed and not _last_signature.is_empty():
 		print("%s sign_message | SUCCESS sig=%s elapsed=%.1fs" % [TAG, _last_signature.substr(0, 20), elapsed])
+		AndroidToastHelper.show("Message signed: %s..." % _last_signature.substr(0, 16))
 		status_updated.emit("Message signed: " + _last_signature.substr(0, 16) + "...")
 		message_signed.emit(_last_signature)
 		return _last_signature
@@ -319,6 +326,7 @@ func sign_transaction(serialized_tx: PackedByteArray) -> String:
 
 	if _signing_completed and not _last_signature.is_empty():
 		print("%s sign_transaction | SUCCESS sig=%s elapsed=%.1fs" % [TAG, _last_signature.substr(0, 20), elapsed])
+		AndroidToastHelper.show("Transaction signed successfully")
 		status_updated.emit("Transaction signed: " + _last_signature.substr(0, 16) + "...")
 		transaction_signed.emit(_last_signature)
 		return _last_signature
@@ -354,6 +362,7 @@ func sign_and_send_transactions(transactions: Array) -> Array:
 			print("%s sign_and_send_transactions | tx %d FAILED" % [TAG, i + 1])
 
 	print("%s sign_and_send_transactions | DONE signed=%d/%d" % [TAG, signatures.size(), transactions.size()])
+	AndroidToastHelper.show("Sent %d transaction(s)" % signatures.size(), true)
 	status_updated.emit("Sent %d transaction(s)" % signatures.size())
 	transactions_sent.emit(signatures)
 	return signatures
@@ -380,6 +389,7 @@ func get_capabilities() -> Dictionary:
 	}
 
 	print("%s get_capabilities | DONE max_txs=%d max_msgs=%d" % [TAG, caps["max_transactions_per_request"], caps["max_messages_per_request"]])
+	AndroidToastHelper.show("Capabilities: max_txs=%d max_msgs=%d" % [caps["max_transactions_per_request"], caps["max_messages_per_request"]])
 	status_updated.emit("Capabilities received")
 	capabilities_received.emit(caps)
 	return caps
@@ -421,6 +431,7 @@ func delete_account() -> void:
 		print("%s delete_account | WalletAdapter recreated, stale state cleared" % TAG)
 
 	print("%s delete_account | DONE cache cleared, session destroyed" % TAG)
+	AndroidToastHelper.show("Account deleted, cache cleared", true)
 	status_updated.emit("Account deleted — all cached data cleared")
 
 

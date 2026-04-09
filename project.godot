@@ -22,6 +22,7 @@ config/icon="res://assets/icon.png"
 
 [autoload]
 
+AndroidToast="*res://scripts/android_toast.gd"
 MWAManager="*res://scripts/mwa_manager.gd"
 AppConfig="*res://scripts/app_config.gd"
 SolanaService="*uid://b2dmsrk6j12y4"
