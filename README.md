@@ -1,25 +1,56 @@
 # MWA Example App — Godot
 
-Minimal Godot 4.x Android app demonstrating all Solana Mobile Wallet Adapter (MWA) 2.0 API methods with Seed Vault integration on Solana Seeker.
+Minimal Godot 4.x Android app demonstrating all Solana Mobile Wallet Adapter (MWA) 2.0 API methods with multi-wallet support (Seed Vault, Phantom, Solflare, Backpack, Jupiter) on Solana Seeker.
+
+## What This Project Does
+
+Brought the Godot Mobile Wallet Adapter SDK to parity with the React Native SDK. Found and fixed 10 integration bugs during testing, submitted a `clearState()` SDK fix ([PR #449](https://github.com/Virus-Axel/godot-solana-sdk/pull/449)) to enable proper disconnect/reconnect flows. Built a complete example app verified on Solana Seeker hardware with all five MWA wallet providers. All flows working: connect, disconnect, reconnect fresh, reconnect cached, delete account, sign message.
+
+Related: [Issue #445 - 10 bugs found during integration](https://github.com/Virus-Axel/godot-solana-sdk/issues/445)
 
 ## Features
 
-- **Authorize** — Connect wallet via MWA (Seed Vault picker)
-- **Reauthorize** — Silent reconnect with cached auth token
-- **Deauthorize** — Revoke wallet authorization
-- **Sign Message** — Sign an arbitrary text message
+- **Authorize** — Connect wallet via MWA with OS wallet picker (all installed wallets)
+- **Reauthorize** — Instant reconnect using cached auth token (no wallet interaction)
+- **Deauthorize** — Disconnect and clear local authorization state
+- **Sign Message** — Sign an arbitrary text message (Seed Vault uses biometric, Phantom uses in-app approval)
 - **Sign Transaction** — Sign a serialized transaction
 - **Sign & Send Transaction** — Sign and broadcast to network
 - **Get Capabilities** — Query wallet limits and supported versions
-- **Auth Cache** — Persistent file-based token storage with extensible interface
-- **Delete Account** — Deauthorize + clear all cached data
+- **Auth Cache** — Persistent file-based token storage at `user://auth_cache.json`
+- **Delete Account** — Sign confirmation + deauthorize + clear all cached data + destroy adapter
+- **Multi-Wallet Support** — Seed Vault, Phantom, Solflare, Backpack, Jupiter
+- **Fresh Connect** — `clearState()` SDK fix ensures OS picker opens after disconnect (no stale cache)
+- **Cached Reconnect** — Separate reconnect button uses AuthCache directly without touching the SDK
+
+## Wallet Support
+
+| Wallet | Connect | Disconnect | Reconnect (Fresh) | Reconnect (Cached) | Sign Message | Delete Account |
+|--------|---------|------------|-------------------|-------------------|--------------|----------------|
+| Seed Vault | Yes | Yes | Yes | Yes | Yes (biometric) | Yes (biometric) |
+| Phantom | Yes | Yes | Yes | Yes | Skipped (SDK session limit) | Yes (sign confirmation) |
+| Solflare | Yes | Yes | Yes | Yes | Skipped (SDK session limit) | Yes (connect confirmation) |
+| Backpack | Yes | Yes | Yes | Yes | Skipped (SDK session limit) | Yes (sign confirmation) |
+| Jupiter | Yes | Yes | Yes | Yes | Skipped (SDK session limit) | Yes (sign confirmation) |
+
+Non-Seed-Vault wallets skip the sign-in step during authorize because the Godot SDK opens a separate MWA session for each method call. `sign_text_message()` in a new unauthorized session fails on these wallets. This is a known SDK limitation documented in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+
+## SDK Fix: clearState()
+
+The core SDK fix that makes disconnect/reconnect work. Without this, `connectWallet()` silently returns the cached connection after the first connect and never opens the OS picker again.
+
+**Root cause:** `clearState()` only reset `myMessageSigningStatus` but did not clear `myResult`. The `connectWallet()` function checks `if (myResult is TransactionResult.Success) { return }` and skips the wallet picker entirely.
+
+**Fix:** Added `myResult = null` to `clearState()` in `GDExtensionAndroidPlugin.kt`. Full writeup: [SDK_CLEARSTATE_FIX.md](SDK_CLEARSTATE_FIX.md)
+
+**PR:** [#449 - fix: clearState() now resets myResult to enable disconnect/reconnect](https://github.com/Virus-Axel/godot-solana-sdk/pull/449)
 
 ## Prerequisites
 
 - Godot 4.2+ (download from https://godotengine.org)
 - Android SDK + NDK (for Android export)
 - `godot-solana-sdk` plugin (https://github.com/Virus-Axel/godot-solana-sdk)
-- Solana Seeker or Android device with a MWA-compatible wallet (Phantom, Solflare, Seed Vault)
+- Solana Seeker or Android device with an MWA-compatible wallet
 
 ## Setup
 
@@ -30,7 +61,8 @@ Minimal Godot 4.x Android app demonstrating all Solana Mobile Wallet Adapter (MW
 
 2. **Clone this project**
    ```bash
-   cd ~/Desktop/grant-godot
+   git clone https://github.com/mstevens843/godot-solana-mwa-example.git
+   cd godot-solana-mwa-example
    ```
 
 3. **Install godot-solana-sdk**
@@ -38,37 +70,35 @@ Minimal Godot 4.x Android app demonstrating all Solana Mobile Wallet Adapter (MW
    - Copy the `addons/SolanaSDK/` folder into this project's `addons/` directory
    - In Godot: Project > Project Settings > Plugins > Enable "Solana SDK"
 
-4. **Add WalletAdapter node**
-   - Open `scenes/Main.tscn` in Godot
-   - The MWAManager autoload will look for a WalletAdapter child node
-   - Add a WalletAdapter node to the scene tree (provided by the plugin)
-
-5. **Configure Android Export**
+4. **Configure Android Export**
    - Editor > Editor Settings > Export > Android: set SDK/NDK paths
    - Project > Export > Add Android preset
    - Set package name, min SDK (API 24+), keystore
 
-6. **Build & Run**
+5. **Build & Run**
    - Export to Android APK
    - Install on Seeker: `adb install -r mwa-example.apk`
-   - Tap "Connect Wallet" → Seed Vault picker should appear
+   - Tap "Connect Wallet" to open the OS wallet picker
 
 ## Project Structure
 
 ```
-grant-godot/
-├── project.godot          # Project config + autoloads
+godot-solana-mwa-example/
+├── project.godot              # Project config + autoloads
 ├── scenes/
-│   ├── Main.tscn          # Landing page (Connect button)
-│   └── Home.tscn          # Home page (all MWA method buttons)
+│   ├── Main.tscn              # Landing page (Connect + Reconnect buttons)
+│   └── Home.tscn              # Home page (all MWA method buttons)
 ├── scripts/
-│   ├── main.gd            # Landing page logic
-│   ├── home.gd            # Home page logic (7 action buttons)
-│   ├── mwa_manager.gd     # MWA singleton (authorize, sign, cache)
-│   ├── auth_cache.gd      # File-based auth token cache
-│   └── app_config.gd      # App identity config
-├── assets/
-│   └── icon.png           # App icon
+│   ├── main.gd                # Landing page logic (OS picker + cached reconnect)
+│   ├── home.gd                # Home page logic (sign, disconnect, delete)
+│   ├── mwa_manager.gd         # MWA singleton (authorize, sign, cache, clearState)
+│   ├── auth_cache.gd          # File-based auth token cache
+│   └── app_config.gd          # App identity config
+├── addons/SolanaSDK/          # godot-solana-sdk plugin (with rebuilt AAR)
+├── SDK_CLEARSTATE_FIX.md      # Detailed writeup of the clearState SDK fix
+├── KNOWN_ISSUES.md            # 8 documented SDK limitations with workarounds
+├── MWA_API_REFERENCE.md       # MWA 2.0 method reference (React Native + Godot)
+├── MWA_INTEGRATION_REPORT.md  # 10 bugs found during integration testing
 └── README.md
 ```
 
@@ -81,7 +111,7 @@ C++ GDExtension (WalletAdapter node from godot-solana-sdk)
     ↓ calls
 Kotlin Android Plugin (wraps mobile-wallet-adapter-clientlib-ktx:2.0.3)
     ↓ Android Intent
-Wallet App (Seed Vault / Phantom / Solflare)
+Wallet App (Seed Vault / Phantom / Solflare / Backpack / Jupiter)
 ```
 
 ## Testing on Solana Seeker (or any Android device)
@@ -94,68 +124,49 @@ Wallet App (Seed Vault / Phantom / Solflare)
 
 ### First-time setup: Fix macOS Gatekeeper
 
-The SDK's native libraries get quarantined by macOS when downloaded. You **must** clear this before exporting or the native types (`WalletAdapter`, `Pubkey`, `Keypair`, etc.) won't load on the device:
+The SDK's native libraries get quarantined by macOS when downloaded. You must clear this before exporting or the native types (`WalletAdapter`, `Pubkey`, `Keypair`, etc.) won't load on the device:
 
 ```bash
-xattr -cr ~/Desktop/grant-godot/addons/SolanaSDK/bin/
+xattr -cr addons/SolanaSDK/bin/
 ```
-
-### The .gdextension file
-
-The file `addons/SolanaSDK/bin/godot-solana-sdk.gdextension` tells Godot which native libraries to package per platform. **If this file is missing, the APK will build without errors but crash at runtime** with:
-
-```
-WalletAdapter class not available. Install godot-solana-sdk plugin and enable it.
-```
-
-If you see this error, verify the file exists. If not, copy it from the SDK release:
-
-```bash
-cp ~/Downloads/SolanaSDK/bin/godot-solana-sdk.gdextension ~/Desktop/grant-godot/addons/SolanaSDK/bin/
-```
-
-Then re-export the APK from Godot.
 
 ### Export APK
 
-1. Open the project in Godot: `open /Applications/Godot.app ~/Desktop/grant-godot/project.godot`
-2. **Project > Export > Android > Export Project**
+1. Open the project in Godot
+2. Project > Export > Android > Export Project
 3. Save as `mwa-example.apk`
 
 ### Install and run
 
 ```bash
-# Uninstall old version and install new APK
-~/Library/Android/sdk/platform-tools/adb uninstall com.example.mwaexample && ~/Library/Android/sdk/platform-tools/adb install ~/Desktop/grant-godot/mwa-example.apk
+# Install APK
+adb install -r mwa-example.apk
 
 # Start log monitoring (run in a separate terminal)
-~/Library/Android/sdk/platform-tools/adb logcat -c && ~/Library/Android/sdk/platform-tools/adb logcat -s godot
+adb logcat -c && adb logcat -s godot
 
-# Launch the app
-~/Library/Android/sdk/platform-tools/adb shell monkey -p com.example.mwaexample -c android.intent.category.LAUNCHER 1
-```
-
-### What to look for in logs
-
-Success — native library loaded:
-```
-[MWAManager] _setup_wallet_adapter | FOUND wallet_adapter=WalletAdapter
-```
-
-Failure — native library missing (see .gdextension section above):
-```
-[MWAManager] _setup_wallet_adapter | NOT_FOUND — WalletAdapter class not available
+# Or filter for app-specific logs only
+adb logcat -c && adb logcat | grep -E "\[MWAManager\]|\[AuthCache\]|\[Main\]|\[Home\]|\[KotlinPlugin\]"
 ```
 
 ### Test flows
 
-| Flow | Expected Toast | Seed Vault Steps |
-|------|---------------|------------------|
-| Connect | "Authorized: ABC..." | Wallet picker → approve → biometric |
-| Sign Message | "Message signed: ..." | Verify → biometric |
-| Disconnect | "Wallet disconnected" | None |
-| Reconnect | "Reauthorizing with cached token..." | Wallet picker → approve → biometric |
-| Delete Account | "Account deleted, cache cleared" | Verify → biometric → clear all |
+| Flow | Expected Result |
+|------|----------------|
+| Connect | OS wallet picker opens, select wallet, approve, lands on Home screen |
+| Sign Message | Wallet opens for signing approval, signature returned |
+| Disconnect | Returns to landing page, Reconnect (cached) button appears |
+| Reconnect (cached) | Instant reconnect using AuthCache, no wallet interaction |
+| Connect (after disconnect) | `clearState()` called, OS picker opens fresh |
+| Delete Account | Sign confirmation in wallet, cache cleared, returns to landing page |
+| Connect (after delete) | `clearState()` called, OS picker opens fresh, clean slate |
+
+## Documentation
+
+- [SDK_CLEARSTATE_FIX.md](SDK_CLEARSTATE_FIX.md) — Root cause analysis and fix for the disconnect/reconnect bug
+- [KNOWN_ISSUES.md](KNOWN_ISSUES.md) — 8 documented SDK limitations with workarounds
+- [MWA_API_REFERENCE.md](MWA_API_REFERENCE.md) — Complete MWA 2.0 method reference
+- [MWA_INTEGRATION_REPORT.md](MWA_INTEGRATION_REPORT.md) — 10 bugs found and fixed during integration testing
 
 ## License
 
