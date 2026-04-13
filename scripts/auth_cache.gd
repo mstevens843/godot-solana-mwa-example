@@ -18,11 +18,12 @@ func _init() -> void:
 
 
 ## Store an authorization result keyed by wallet public key.
-func set_auth(pubkey: String, auth_token: String, wallet_uri_base: String = "") -> void:
-	print("%s set_auth | START pubkey=%s auth_token_len=%d wallet_uri_base=%s" % [TAG, pubkey, auth_token.length(), wallet_uri_base])
+func set_auth(pubkey: String, auth_token: String, wallet_uri_base: String = "", wallet_type: int = -1) -> void:
+	print("%s set_auth | START pubkey=%s auth_token_len=%d wallet_uri_base=%s wallet_type=%d" % [TAG, pubkey, auth_token.length(), wallet_uri_base, wallet_type])
 	_data[pubkey] = {
 		"auth_token": auth_token,
 		"wallet_uri_base": wallet_uri_base,
+		"wallet_type": wallet_type,
 		"timestamp": Time.get_unix_time_from_system(),
 	}
 	_save()

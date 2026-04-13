@@ -18,11 +18,16 @@ const TAG := "[Home]"
 func _ready() -> void:
 	print("%s _ready | START" % TAG)
 
-	# Display connected pubkey
+	# Display connected pubkey and wallet type
 	var pubkey := MWAManager.connected_pubkey
-	print("%s _ready | connected_pubkey=%s is_connected=%s" % [TAG, pubkey, str(MWAManager.get_is_connected())])
+	var wallet_name := MWAManager._wallet_type_name(MWAManager.connected_wallet_type)
+	print("%s _ready | connected_pubkey=%s is_connected=%s wallet=%s (type=%d)" % [TAG, pubkey, str(MWAManager.get_is_connected()), wallet_name, MWAManager.connected_wallet_type])
 	if pubkey.length() > 8:
-		pubkey_label.text = pubkey.substr(0, 4) + "..." + pubkey.substr(pubkey.length() - 4)
+		var short_key := pubkey.substr(0, 4) + "..." + pubkey.substr(pubkey.length() - 4)
+		if not wallet_name.is_empty():
+			pubkey_label.text = short_key + " (" + wallet_name + ")"
+		else:
+			pubkey_label.text = short_key
 	else:
 		pubkey_label.text = pubkey if not pubkey.is_empty() else "Not connected"
 

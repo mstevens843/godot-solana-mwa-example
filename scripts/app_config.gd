@@ -6,7 +6,8 @@ extends Node
 const APP_NAME := "MWA Example App"
 const APP_URI := "https://example.com"
 const APP_ICON_PATH := "/icon.png"
-const CLUSTER := "devnet"  # "devnet", "testnet", or "mainnet-beta"
+const CLUSTER := "mainnet-beta"  # "devnet", "testnet", or "mainnet-beta"
+const USE_OS_PICKER := true  # true = OS wallet picker, false = in-app wallet buttons (stores wallet type)
 
 
 func _ready() -> void:

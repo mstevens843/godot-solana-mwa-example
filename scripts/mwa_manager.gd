@@ -2,8 +2,20 @@ extends Node
 
 ## MWA Manager — Singleton that wraps the godot-solana-sdk WalletAdapter
 ## and exposes clean async methods for all MWA 2.0 operations.
+##
+## NOTE: The Godot SDK's WalletAdapter does not expose get_auth_token() or
+## deauthorize(). Auth tokens are handled internally by the Kotlin plugin
+## but not surfaced to GDScript. reauthorize() falls back to full authorize().
+## The "Error loading GDExtension: WalletAdapterAndroid/plugin.gdextension"
+## error on launch is expected and harmless — the AAR loads via Gradle, not GDExtension.
 
 const TAG := "[MWAManager]"
+const DIAG_INTERVAL := 2.0  # seconds between diagnostic logs (was 1.0 — reduced noise)
+
+# Wallet type IDs (from godot-solana-sdk WalletAdapterUI)
+const WALLET_PHANTOM := 20
+const WALLET_SOLFLARE := 25
+const WALLET_BACKPACK := 36
 
 signal authorized(pubkey: String)
 signal authorization_failed(error: String)
@@ -16,6 +28,7 @@ signal status_updated(message: String)
 
 var wallet_adapter: Node = null  # WalletAdapter node from godot-solana-sdk
 var connected_pubkey: String = ""
+var connected_wallet_type: int = -1  # actual wallet used — set during authorize, stored in cache
 var auth_token: String = ""
 var wallet_uri_base: String = ""
 var cache: AuthCache = AuthCache.new()
@@ -29,12 +42,15 @@ var _waiting_for_connection: bool = false
 var _waiting_for_signing: bool = false
 var _diag_timer: float = 0.0
 var _pre_connect_key: String = ""
+var _deleted_keys: Array = []  # pubkeys explicitly deleted — reject in poll fallback
+var _key_available: bool = false  # true ONLY after _on_connected signal fires — prevents Pubkey spam
 
 
 func _ready() -> void:
 	print("%s _ready | START" % TAG)
 	print("%s _ready | platform=%s app=%s cluster=%s" % [TAG, OS.get_name(), AppConfig.APP_NAME, AppConfig.CLUSTER])
 	_setup_wallet_adapter()
+	_dump_android_plugin_diagnostics()
 	print("%s _ready | DONE wallet_adapter_found=%s" % [TAG, str(wallet_adapter != null)])
 
 
@@ -45,15 +61,14 @@ func _process(delta: float) -> void:
 		return
 
 	_diag_timer += delta
-	if _diag_timer < 1.0:
+	if _diag_timer < DIAG_INTERVAL:
 		return
 	_diag_timer = 0.0
 
-	# Poll WalletAdapter state every 1s while waiting
-	var key_str = _extract_pubkey_string(wallet_adapter.get_connected_key())
-	var raw_str = str(wallet_adapter.get_connected_key())
+	# Poll WalletAdapter state while waiting (safe — no Pubkey error spam)
+	var key_str = _safe_get_key_string()
 	var wt = wallet_adapter.wallet_type if "wallet_type" in wallet_adapter else -1
-	print("%s _process DIAG | waiting_conn=%s waiting_sign=%s key='%s' raw='%s' wallet_type=%s completed=%s succeeded=%s pre='%s'" % [TAG, str(_waiting_for_connection), str(_waiting_for_signing), key_str, raw_str, str(wt), str(_connection_completed), str(_connection_succeeded), _pre_connect_key])
+	print("%s _process DIAG | waiting_conn=%s waiting_sign=%s key='%s' wallet_type=%s completed=%s succeeded=%s pre='%s' deleted_keys=%d" % [TAG, str(_waiting_for_connection), str(_waiting_for_signing), key_str, str(wt), str(_connection_completed), str(_connection_succeeded), _pre_connect_key, _deleted_keys.size()])
 
 
 func _setup_wallet_adapter() -> void:
@@ -123,6 +138,15 @@ func _setup_wallet_adapter() -> void:
 	else:
 		print("%s _setup_wallet_adapter | WARN get_available_wallets not found" % TAG)
 
+	# Probe SDK API surface for auth_token, clear_state, deauthorize, etc.
+	for method in ["get_auth_token", "clear_state", "deauthorize", "get_capabilities", "sign_in", "get_authorization_token"]:
+		print("%s _setup_wallet_adapter | probe %s=%s" % [TAG, method, str(wallet_adapter.has_method(method))])
+
+	# Try to clear stale state from previous session
+	if wallet_adapter.has_method("clear_state"):
+		wallet_adapter.clear_state()
+		print("%s _setup_wallet_adapter | clear_state() called" % TAG)
+
 	print("%s _setup_wallet_adapter | DONE signals connected" % TAG)
 
 
@@ -136,23 +160,37 @@ func _connect_signal(sig_name: String, handler: Callable) -> void:
 
 ## ─── AUTHORIZE ───────────────────────────────────────────────────────────────
 
-func authorize() -> bool:
-	print("%s authorize | START is_connected=%s wallet_adapter=%s" % [TAG, str(_is_connected), str(wallet_adapter != null)])
+func authorize(wallet_type_id: int = -1) -> bool:
+	print("%s authorize | START is_connected=%s wallet_adapter=%s wallet_type_id=%d (%s)" % [TAG, str(_is_connected), str(wallet_adapter != null), wallet_type_id, _wallet_type_name(wallet_type_id)])
 
 	if wallet_adapter == null:
 		print("%s authorize | FAIL wallet_adapter is null" % TAG)
 		authorization_failed.emit("WalletAdapter not initialized")
 		return false
 
+	# Set wallet_type BEFORE connect so the SDK targets the right wallet
+	if wallet_type_id >= 0 and "wallet_type" in wallet_adapter:
+		wallet_adapter.wallet_type = wallet_type_id
+		print("%s authorize | set wallet_adapter.wallet_type=%d" % [TAG, wallet_type_id])
+
+	# Reset all state flags (prevent leaks from prior attempts)
 	_connection_completed = false
 	_connection_succeeded = false
 	_waiting_for_connection = true
+	_signing_completed = false
+	_last_signature = ""
+	_key_available = false
 	_diag_timer = 0.0
 
+	# Log wallet_type for this attempt
+	var current_wallet_type: int = wallet_adapter.wallet_type if "wallet_type" in wallet_adapter else -1
+	print("%s authorize | wallet_type=%d (%s)" % [TAG, current_wallet_type, _wallet_type_name(current_wallet_type)])
+
 	# Snapshot current key BEFORE connect — so we can detect a NEW connection vs stale
-	_pre_connect_key = _extract_pubkey_string(wallet_adapter.get_connected_key())
+	_pre_connect_key = _safe_get_key_string()
 	print("%s authorize | pre_connect_key='%s'" % [TAG, _pre_connect_key])
 	print("%s authorize | calling wallet_adapter.connect_wallet()" % TAG)
+	_dump_android_plugin_diagnostics()
 	status_updated.emit("Requesting wallet authorization...")
 	wallet_adapter.connect_wallet()
 
@@ -163,10 +201,15 @@ func authorize() -> bool:
 		await get_tree().create_timer(0.5).timeout
 		elapsed += 0.5
 
-		# Polling fallback: check get_connected_key() directly
+		# Polling fallback: check get_connected_key() directly (safe — no error spam)
 		if not _connection_completed and wallet_adapter.has_method("get_connected_key"):
-			var poll_key_str = _extract_pubkey_string(wallet_adapter.get_connected_key())
-			if poll_key_str.length() > 20 and poll_key_str != _pre_connect_key:
+			var poll_key_str = _safe_get_key_string()
+
+			if poll_key_str.length() > 20 and poll_key_str in _deleted_keys:
+				# Stale key from a deleted account — ignore it
+				if int(elapsed) % 5 == 0 and elapsed > 1.0:
+					print("%s authorize | POLL FALLBACK REJECTED stale deleted key=%s elapsed=%.1fs" % [TAG, poll_key_str, elapsed])
+			elif poll_key_str.length() > 20 and poll_key_str != _pre_connect_key:
 				print("%s authorize | POLL FALLBACK detected NEW key=%s (was='%s') elapsed=%.1fs" % [TAG, poll_key_str, _pre_connect_key, elapsed])
 				_connection_succeeded = true
 				_connection_completed = true
@@ -181,39 +224,60 @@ func authorize() -> bool:
 	if _connection_completed and _connection_succeeded:
 		var raw_key = wallet_adapter.get_connected_key()
 		connected_pubkey = _extract_pubkey_string(raw_key)
-		_is_connected = true
-		print("%s authorize | CONNECTED pubkey=%s elapsed=%.1fs — now signing to confirm" % [TAG, connected_pubkey, elapsed])
-		AndroidToastHelper.show("Authorized: %s" % _truncate_pubkey(connected_pubkey))
 
-		# Auto sign message to complete auth (Seed Vault biometric confirmation)
-		status_updated.emit("Confirming identity...")
-		var sign_in_sig = await sign_message("Sign in to %s" % AppConfig.APP_NAME)
-		if sign_in_sig.is_empty():
-			print("%s authorize | FAIL sign-in signature rejected or timed out" % TAG)
-			AndroidToastHelper.show("Sign-in rejected")
+		# REJECT if this key was explicitly deleted — don't auto-reconnect stale accounts
+		if connected_pubkey in _deleted_keys:
+			print("%s authorize | REJECTED deleted key=%s — user must choose a different wallet" % [TAG, connected_pubkey])
 			_is_connected = false
 			connected_pubkey = ""
-			status_updated.emit("Sign-in cancelled")
-			authorization_failed.emit("Sign-in confirmation rejected")
+			_key_available = false
+			status_updated.emit("This account was deleted. Choose a different wallet.")
+			authorization_failed.emit("Deleted account — choose a different wallet")
 			return false
 
-		print("%s authorize | SIGNED sig=%s — auth complete" % [TAG, sign_in_sig.substr(0, 20)])
-		AndroidToastHelper.show("Biometric sign-in verified")
+		_is_connected = true
 
-		# Cache auth
-		cache.set_auth(connected_pubkey, auth_token, wallet_uri_base)
+		# Store the wallet type used for this connection
+		connected_wallet_type = wallet_adapter.wallet_type if "wallet_type" in wallet_adapter else -1
+		print("%s authorize | CONNECTED pubkey=%s elapsed=%.1fs wallet_type=%d (%s)" % [TAG, connected_pubkey, elapsed, connected_wallet_type, _wallet_type_name(connected_wallet_type)])
+		AndroidToastHelper.show("Authorized: %s" % _truncate_pubkey(connected_pubkey))
+
+		# Try to capture auth_token from WalletAdapter (if SDK exposes it)
+		for method in ["get_auth_token", "get_authorization_token"]:
+			if wallet_adapter.has_method(method):
+				var token = wallet_adapter.call(method)
+				if token != null and str(token).length() > 0:
+					auth_token = str(token)
+					print("%s authorize | captured auth_token via %s len=%d" % [TAG, method, auth_token.length()])
+					break
+
+		# connect_wallet() IS the MWA authorize — no separate sign-in needed.
+		# NOTE: sign_text_message() opens a NEW MWA session (SDK bug — see KNOWN_ISSUES.md),
+		# which causes the OS wallet picker to appear again. Skip it during authorize.
+		# wallet_type is also unreliable (defaults to 20 regardless of actual wallet).
+		print("%s authorize | auth complete via connect_wallet() — skipping sign_text_message (SDK session bug)" % TAG)
+		AndroidToastHelper.show("Connected: %s" % _truncate_pubkey(connected_pubkey))
+
+		# Cache auth with wallet type
+		cache.set_auth(connected_pubkey, auth_token, wallet_uri_base, connected_wallet_type)
 		AndroidToastHelper.show("Auth cached for %s..." % connected_pubkey.substr(0, 8))
-		print("%s authorize | cached auth pubkey=%s auth_token_len=%d" % [TAG, connected_pubkey, auth_token.length()])
+		print("%s authorize | cached auth pubkey=%s auth_token_len=%d wallet_type=%d" % [TAG, connected_pubkey, auth_token.length(), connected_wallet_type])
+
+		# Clear this key from deleted list if it was there (fresh re-auth)
+		if connected_pubkey in _deleted_keys:
+			_deleted_keys.erase(connected_pubkey)
 
 		status_updated.emit("Connected: " + _truncate_pubkey(connected_pubkey))
 		authorized.emit(connected_pubkey)
 		return true
 	elif _connection_completed and not _connection_succeeded:
+		_waiting_for_connection = false
 		print("%s authorize | REJECTED by wallet elapsed=%.1fs" % [TAG, elapsed])
 		status_updated.emit("Authorization rejected by wallet")
 		authorization_failed.emit("User rejected or wallet error")
 		return false
 	else:
+		_waiting_for_connection = false
 		print("%s authorize | TIMEOUT elapsed=%.1fs" % [TAG, elapsed])
 		status_updated.emit("Authorization timed out")
 		authorization_failed.emit("Timeout — no response from wallet")
@@ -246,12 +310,16 @@ func deauthorize() -> void:
 	print("%s deauthorize | START pubkey=%s is_connected=%s" % [TAG, connected_pubkey, str(_is_connected)])
 	status_updated.emit("Deauthorizing...")
 
-	# TODO: Call wallet_adapter deauthorize when SDK supports it
-	# wallet_adapter.deauthorize(auth_token)
-	print("%s deauthorize | TODO — SDK deauthorize not yet implemented, clearing local state" % TAG)
+	# Try SDK deauthorize if available
+	if wallet_adapter != null and wallet_adapter.has_method("deauthorize"):
+		print("%s deauthorize | calling wallet_adapter.deauthorize()" % TAG)
+		wallet_adapter.deauthorize()
+	else:
+		print("%s deauthorize | SDK deauthorize not available, clearing local state" % TAG)
 
 	var old_pubkey := connected_pubkey
 	connected_pubkey = ""
+	connected_wallet_type = -1
 	auth_token = ""
 	wallet_uri_base = ""
 	_is_connected = false
@@ -259,6 +327,7 @@ func deauthorize() -> void:
 	_connection_succeeded = false
 	_signing_completed = false
 	_last_signature = ""
+	_key_available = false
 
 	print("%s deauthorize | DONE old_pubkey=%s state_cleared=true" % [TAG, old_pubkey])
 	AndroidToastHelper.show("Wallet disconnected")
@@ -278,6 +347,7 @@ func sign_message(message: String) -> String:
 
 	_signing_completed = false
 	_last_signature = ""
+	_waiting_for_signing = true
 	print("%s sign_message | calling wallet_adapter.sign_text_message()" % TAG)
 	status_updated.emit("Signing message...")
 	wallet_adapter.sign_text_message(message)
@@ -288,6 +358,8 @@ func sign_message(message: String) -> String:
 	while not _signing_completed and elapsed < 30.0:
 		await get_tree().create_timer(0.1).timeout
 		elapsed += 0.1
+
+	_waiting_for_signing = false
 
 	if _signing_completed and not _last_signature.is_empty():
 		print("%s sign_message | SUCCESS sig=%s elapsed=%.1fs" % [TAG, _last_signature.substr(0, 20), elapsed])
@@ -313,6 +385,7 @@ func sign_transaction(serialized_tx: PackedByteArray) -> String:
 
 	_signing_completed = false
 	_last_signature = ""
+	_waiting_for_signing = true
 	print("%s sign_transaction | calling wallet_adapter.sign_message(tx, 0)" % TAG)
 	status_updated.emit("Signing transaction...")
 	wallet_adapter.sign_message(serialized_tx, 0)
@@ -323,6 +396,8 @@ func sign_transaction(serialized_tx: PackedByteArray) -> String:
 	while not _signing_completed and elapsed < 30.0:
 		await get_tree().create_timer(0.1).timeout
 		elapsed += 0.1
+
+	_waiting_for_signing = false
 
 	if _signing_completed and not _last_signature.is_empty():
 		print("%s sign_transaction | SUCCESS sig=%s elapsed=%.1fs" % [TAG, _last_signature.substr(0, 20), elapsed])
@@ -405,17 +480,47 @@ func delete_account() -> void:
 		status_updated.emit("Not connected — cannot delete")
 		return
 
-	# Require Seed Vault confirmation before deleting
-	print("%s delete_account | requesting Seed Vault confirmation via sign_message" % TAG)
-	status_updated.emit("Confirm deletion in Seed Vault...")
-	var sig = await sign_message("Confirm account deletion for %s" % AppConfig.APP_NAME)
+	# Require wallet confirmation before deleting.
+	# Route based on connected_wallet_type (only reliable when USE_OS_PICKER = false):
+	#   Solflare (25) → connect_wallet() only (signMessage broken on MWA)
+	#   All others → sign_text_message() (biometric/sign confirmation)
+	#   Unknown (-1, OS picker mode) → try sign, fall back to connect
+	print("%s delete_account | connected_wallet_type=%d (%s)" % [TAG, connected_wallet_type, _wallet_type_name(connected_wallet_type)])
 
-	if sig.is_empty():
-		print("%s delete_account | FAIL user rejected or signing failed — aborting delete" % TAG)
-		status_updated.emit("Delete cancelled — confirmation required")
-		return
+	if connected_wallet_type == WALLET_SOLFLARE:
+		# Solflare: signMessage broken — use connect_wallet() like SolPulse's nativeAuthorize()
+		print("%s delete_account | Solflare — using connect_wallet() for confirmation" % TAG)
+		status_updated.emit("Approve in Solflare to confirm deletion...")
+		_connection_completed = false
+		_connection_succeeded = false
+		_key_available = false
+		wallet_adapter.connect_wallet()
 
-	print("%s delete_account | confirmed sig=%s — proceeding with deletion" % [TAG, sig.substr(0, 20)])
+		var elapsed := 0.0
+		while not _connection_completed and elapsed < 30.0:
+			await get_tree().create_timer(0.5).timeout
+			elapsed += 0.5
+
+		if not (_connection_completed and _connection_succeeded):
+			print("%s delete_account | Solflare confirmation rejected — cancelling delete" % TAG)
+			status_updated.emit("Delete cancelled — wallet confirmation required")
+			return
+		print("%s delete_account | confirmed via Solflare connect_wallet()" % TAG)
+	else:
+		# All other wallets: sign_text_message for confirmation
+		print("%s delete_account | requesting confirmation via sign_message" % TAG)
+		status_updated.emit("Confirm deletion in your wallet...")
+		var sig = await sign_message("Confirm account deletion for %s" % AppConfig.APP_NAME)
+		if sig.is_empty():
+			print("%s delete_account | sign failed — aborting delete" % TAG)
+			status_updated.emit("Delete cancelled — confirmation required")
+			return
+		print("%s delete_account | confirmed sig=%s — proceeding with deletion" % [TAG, sig.substr(0, 20)])
+
+	# Record the key being deleted so poll fallback won't accept it as a reconnect
+	if not connected_pubkey.is_empty():
+		_deleted_keys.append(connected_pubkey)
+		print("%s delete_account | recorded deleted key=%s total_deleted=%d" % [TAG, connected_pubkey, _deleted_keys.size()])
 
 	await deauthorize()
 	cache.clear_all()
@@ -427,6 +532,8 @@ func delete_account() -> void:
 		wallet_adapter = null
 		remove_child(old_adapter)
 		old_adapter.queue_free()
+		await get_tree().process_frame
+		await get_tree().process_frame
 		_setup_wallet_adapter()
 		print("%s delete_account | WalletAdapter recreated, stale state cleared" % TAG)
 
@@ -437,8 +544,88 @@ func delete_account() -> void:
 
 ## ─── HELPERS ─────────────────────────────────────────────────────────────────
 
+## Dump exhaustive diagnostics about the Android plugin layer.
+## Logs every singleton, every method, every property — pure observation, no fixes.
+func _dump_android_plugin_diagnostics() -> void:
+	print("%s DIAG_PLUGIN | ========== ANDROID PLUGIN DIAGNOSTICS ==========" % TAG)
+
+	# 1. List ALL engine singletons
+	var singletons = Engine.get_singleton_list()
+	print("%s DIAG_PLUGIN | Engine singletons count=%d list=%s" % [TAG, singletons.size(), str(singletons)])
+
+	# 2. Check WalletAdapterAndroid singleton
+	var has_wa = Engine.has_singleton("WalletAdapterAndroid")
+	print("%s DIAG_PLUGIN | has_singleton('WalletAdapterAndroid')=%s" % [TAG, str(has_wa)])
+
+	if has_wa:
+		var plugin = Engine.get_singleton("WalletAdapterAndroid")
+		print("%s DIAG_PLUGIN | plugin=%s type=%s class=%s" % [TAG, str(plugin), str(typeof(plugin)), plugin.get_class()])
+
+		# Dump ALL methods on the plugin
+		var methods = plugin.get_method_list()
+		print("%s DIAG_PLUGIN | plugin method_count=%d" % [TAG, methods.size()])
+		for m in methods:
+			print("%s DIAG_PLUGIN | plugin_method: %s" % [TAG, m.get("name", "?")])
+
+		# Try every possible method name
+		for method_name in ["clearState", "clear_state", "getConnectionStatus", "get_connection_status",
+				"getConnectedKey", "get_connected_key", "getAuthToken", "get_auth_token",
+				"connectWallet", "connect_wallet", "getLatestAction", "get_latest_action",
+				"getSigningStatus", "get_signing_status", "getMessageSignature"]:
+			var has = plugin.has_method(method_name)
+			if has:
+				print("%s DIAG_PLUGIN | TRY %s → EXISTS" % [TAG, method_name])
+				if method_name in ["clearState", "clear_state", "getConnectionStatus",
+						"get_connection_status", "getLatestAction", "get_latest_action",
+						"getSigningStatus", "get_signing_status"]:
+					var result = plugin.call(method_name)
+					print("%s DIAG_PLUGIN | CALL %s() → %s (type=%s)" % [TAG, method_name, str(result), str(typeof(result))])
+			else:
+				print("%s DIAG_PLUGIN | TRY %s → NOT_FOUND" % [TAG, method_name])
+
+	# 3. WalletAdapter node methods and properties
+	if wallet_adapter != null:
+		print("%s DIAG_PLUGIN | wallet_adapter class=%s" % [TAG, wallet_adapter.get_class()])
+		var wa_methods = wallet_adapter.get_method_list()
+		print("%s DIAG_PLUGIN | wallet_adapter method_count=%d" % [TAG, wa_methods.size()])
+		for m in wa_methods:
+			var mname = m.get("name", "?")
+			if not mname.begins_with("_") and not mname in ["get_class", "get_name", "get_parent", "set", "get", "has_method", "call", "emit_signal", "connect", "disconnect", "is_connected"]:
+				print("%s DIAG_PLUGIN | wa_method: %s" % [TAG, mname])
+
+		for pname in ["connected", "wallet_type", "active_signer_index", "wallet_state"]:
+			if pname in wallet_adapter:
+				var val = wallet_adapter.get(pname)
+				print("%s DIAG_PLUGIN | wa_prop: %s = %s" % [TAG, pname, str(val)])
+
+	# 4. JavaClassWrapper availability
+	print("%s DIAG_PLUGIN | ClassDB.class_exists('JavaClassWrapper')=%s" % [TAG, str(ClassDB.class_exists("JavaClassWrapper"))])
+	print("%s DIAG_PLUGIN | Engine.has_singleton('JavaClassWrapper')=%s" % [TAG, str(Engine.has_singleton("JavaClassWrapper"))])
+
+	if Engine.has_singleton("JavaClassWrapper"):
+		var jcw = Engine.get_singleton("JavaClassWrapper")
+		print("%s DIAG_PLUGIN | JavaClassWrapper=%s class=%s" % [TAG, str(jcw), jcw.get_class()])
+		if jcw.has_method("wrap"):
+			var kt = jcw.wrap("plugin.walletadapterandroid.MyComposableKt")
+			print("%s DIAG_PLUGIN | MyComposableKt wrap=%s" % [TAG, str(kt)])
+			if kt != null:
+				for m in kt.get_method_list():
+					print("%s DIAG_PLUGIN | kt_method: %s" % [TAG, m.get("name", "?")])
+
+	print("%s DIAG_PLUGIN | ========== END DIAGNOSTICS ==========" % TAG)
+
+
 func get_is_connected() -> bool:
 	return _is_connected
+
+
+## Safely get the connected key as a string WITHOUT triggering C++ Pubkey
+## validation errors. Returns "" if no key is connected.
+## Only calls get_connected_key() when _key_available is true (set by _on_connected signal).
+func _safe_get_key_string() -> String:
+	if not _key_available or wallet_adapter == null:
+		return ""
+	return _extract_pubkey_string(wallet_adapter.get_connected_key())
 
 
 ## Extract a clean base58 pubkey string from a Pubkey object.
@@ -468,13 +655,64 @@ func _truncate_pubkey(pubkey: String) -> String:
 	return pubkey
 
 
+func _wallet_type_name(wallet_type: int) -> String:
+	match wallet_type:
+		WALLET_PHANTOM: return "Phantom"
+		WALLET_SOLFLARE: return "Solflare"
+		WALLET_BACKPACK: return "Backpack"
+		_: return "Seed Vault/Other"
+
+
+## Force the wallet to open for re-authorization confirmation.
+## Destroys the current WalletAdapter to kill the existing MWA session,
+## then creates a fresh one and calls connect_wallet(). With no session,
+## the wallet MUST open its authorization UI — no auto-reconnect.
+## Returns true if the user approved in the wallet, false if rejected/timed out.
+func _reauthorize_for_confirmation() -> bool:
+	# Kill the existing MWA session so connect_wallet() actually opens the wallet
+	print("%s _reauthorize_for_confirmation | destroying adapter to force fresh MWA session" % TAG)
+	if wallet_adapter != null:
+		var old_adapter = wallet_adapter
+		wallet_adapter = null
+		remove_child(old_adapter)
+		old_adapter.queue_free()
+		await get_tree().process_frame
+		await get_tree().process_frame
+
+	# Create fresh adapter — no existing session
+	_setup_wallet_adapter()
+	if wallet_adapter == null:
+		print("%s _reauthorize_for_confirmation | FAIL could not create WalletAdapter" % TAG)
+		return false
+
+	# Now connect_wallet() WILL open the wallet since there's no session
+	_connection_completed = false
+	_connection_succeeded = false
+	_key_available = false
+	wallet_adapter.connect_wallet()
+
+	print("%s _reauthorize_for_confirmation | waiting for wallet approval (timeout=30s)" % TAG)
+	var elapsed := 0.0
+	while not _connection_completed and elapsed < 30.0:
+		await get_tree().create_timer(0.5).timeout
+		elapsed += 0.5
+
+	if _connection_completed and _connection_succeeded:
+		_is_connected = true
+		connected_pubkey = _extract_pubkey_string(wallet_adapter.get_connected_key())
+		print("%s _reauthorize_for_confirmation | CONFIRMED pubkey=%s elapsed=%.1fs" % [TAG, connected_pubkey, elapsed])
+		return true
+	else:
+		print("%s _reauthorize_for_confirmation | REJECTED or TIMEOUT elapsed=%.1fs" % [TAG, elapsed])
+		return false
+
+
 ## ─── SIGNAL HANDLERS ─────────────────────────────────────────────────────────
 
 func _on_connected() -> void:
-	var key := ""
-	if wallet_adapter and wallet_adapter.has_method("get_connected_key"):
-		key = wallet_adapter.get_connected_key()
-	print("%s _on_connected | SIGNAL RECEIVED pubkey=%s" % [TAG, key])
+	_key_available = true  # now safe to call get_connected_key()
+	var key_str = _safe_get_key_string()
+	print("%s _on_connected | SIGNAL RECEIVED pubkey=%s" % [TAG, key_str])
 	_connection_succeeded = true
 	_connection_completed = true
 
@@ -514,8 +752,8 @@ func _on_message_signed(sig: Variant) -> void:
 	_signing_completed = true
 
 
-func _on_signing_failed() -> void:
-	print("%s _on_signing_failed | SIGNAL RECEIVED" % TAG)
-	_signing_completed = true  # Set flag so wait loop exits
+func _on_signing_failed(error_info: Variant = null) -> void:
+	print("%s _on_signing_failed | SIGNAL RECEIVED error=%s type=%s" % [TAG, str(error_info), str(typeof(error_info))])
+	_signing_completed = true
 	_last_signature = ""
 	status_updated.emit("Signing failed")
