@@ -10,7 +10,6 @@ const TAG := "[Home]"
 @onready var sign_tx_button: Button = $VBoxContainer/ButtonGrid/SignTxButton
 @onready var sign_send_button: Button = $VBoxContainer/ButtonGrid/SignSendButton
 @onready var capabilities_button: Button = $VBoxContainer/ButtonGrid/CapabilitiesButton
-@onready var reconnect_button: Button = $VBoxContainer/ButtonGrid/ReconnectButton
 @onready var disconnect_button: Button = $VBoxContainer/DisconnectButton
 @onready var delete_button: Button = $VBoxContainer/DeleteButton
 
@@ -36,7 +35,6 @@ func _ready() -> void:
 	sign_tx_button.pressed.connect(_on_sign_transaction)
 	sign_send_button.pressed.connect(_on_sign_and_send)
 	capabilities_button.pressed.connect(_on_get_capabilities)
-	reconnect_button.pressed.connect(_on_reconnect)
 	disconnect_button.pressed.connect(_on_disconnect)
 	delete_button.pressed.connect(_on_delete_account)
 
@@ -63,23 +61,117 @@ func _on_sign_message() -> void:
 
 
 func _on_sign_transaction() -> void:
-	print("%s _on_sign_transaction | START" % TAG)
+	print("%s _on_sign_transaction | START connected_pubkey=%s is_connected=%s wallet_type=%d" % [TAG, MWAManager.connected_pubkey, str(MWAManager.get_is_connected()), MWAManager.connected_wallet_type])
 	_disable_buttons()
-	# TODO: Build a real memo transaction with the SDK
-	# var tx := TransactionBuilder.new().add_memo("MWA test").build()
-	# var sig := await MWAManager.sign_transaction(tx.serialize())
-	print("%s _on_sign_transaction | PLACEHOLDER — needs real serialized tx from SDK" % TAG)
-	status_label.text = "Sign Transaction: requires a real serialized tx.\nBuild a memo tx with the SDK's TransactionBuilder."
+	status_label.text = "Building transaction..."
+
+	# Build a minimal 0-lamport SOL transfer to self (harmless demo tx)
+	var pubkey_str := MWAManager.connected_pubkey
+	print("%s _on_sign_transaction | creating Pubkey from '%s' (len=%d)" % [TAG, pubkey_str, pubkey_str.length()])
+	var payer = Pubkey.new_from_string(pubkey_str)
+	print("%s _on_sign_transaction | payer=%s payer_type=%s" % [TAG, str(payer), str(typeof(payer))])
+
+	var ix = SystemProgram.transfer(payer, payer, 0)
+	print("%s _on_sign_transaction | instruction created ix=%s ix_type=%s" % [TAG, str(ix), str(typeof(ix))])
+
+	var tx := Transaction.new()
+	add_child(tx)
+	tx.set_payer(payer)
+	tx.add_instruction(ix)
+	print("%s _on_sign_transaction | transaction built, payer set, instruction added" % TAG)
+
+	# Fetch recent blockhash from RPC
+	print("%s _on_sign_transaction | fetching blockhash via tx.update_latest_blockhash()" % TAG)
+	status_label.text = "Fetching blockhash..."
+	tx.update_latest_blockhash()
+	var bh_result: Dictionary = await tx.blockhash_updated
+	print("%s _on_sign_transaction | blockhash_updated signal received result_keys=%s has_result=%s" % [TAG, str(bh_result.keys()), str(bh_result.has("result"))])
+	if bh_result.has("result"):
+		print("%s _on_sign_transaction | blockhash=%s" % [TAG, str(bh_result["result"]).substr(0, 80)])
+	else:
+		print("%s _on_sign_transaction | blockhash_error=%s" % [TAG, str(bh_result).substr(0, 120)])
+
+	if not bh_result.has("result"):
+		print("%s _on_sign_transaction | FAIL no blockhash in result — cannot build valid transaction" % TAG)
+		status_label.text = "Failed to fetch blockhash"
+		tx.queue_free()
+		_enable_buttons()
+		return
+
+	# Serialize and sign via MWA
+	var tx_bytes := tx.serialize()
+	print("%s _on_sign_transaction | serialized tx_bytes_size=%d tx_bytes_hex=%s" % [TAG, tx_bytes.size(), tx_bytes.hex_encode().substr(0, 40)])
+	status_label.text = "Approve in wallet..."
+
+	print("%s _on_sign_transaction | calling MWAManager.sign_transaction()" % TAG)
+	var sig := await MWAManager.sign_transaction(tx_bytes)
+	tx.queue_free()
+
+	print("%s _on_sign_transaction | RESULT sig_empty=%s sig_len=%d sig=%s" % [TAG, str(sig.is_empty()), sig.length(), sig.substr(0, 40)])
+	if sig.is_empty():
+		print("%s _on_sign_transaction | FAIL empty signature returned from MWA" % TAG)
+		status_label.text = "Sign transaction failed"
+	else:
+		print("%s _on_sign_transaction | SUCCESS sig=%s" % [TAG, sig.substr(0, 40)])
+		status_label.text = "Signed: " + sig.substr(0, 20) + "..."
 	_enable_buttons()
 	print("%s _on_sign_transaction | DONE" % TAG)
 
 
 func _on_sign_and_send() -> void:
-	print("%s _on_sign_and_send | START" % TAG)
+	print("%s _on_sign_and_send | START connected_pubkey=%s is_connected=%s wallet_type=%d" % [TAG, MWAManager.connected_pubkey, str(MWAManager.get_is_connected()), MWAManager.connected_wallet_type])
 	_disable_buttons()
-	# TODO: Build real transactions with the SDK
-	print("%s _on_sign_and_send | PLACEHOLDER — needs real transactions from SDK" % TAG)
-	status_label.text = "Sign & Send: requires real transactions.\nBuild transactions with the SDK."
+	status_label.text = "Building transaction..."
+
+	# Build a minimal 0-lamport SOL transfer to self (harmless demo tx)
+	var pubkey_str := MWAManager.connected_pubkey
+	print("%s _on_sign_and_send | creating Pubkey from '%s' (len=%d)" % [TAG, pubkey_str, pubkey_str.length()])
+	var payer = Pubkey.new_from_string(pubkey_str)
+	print("%s _on_sign_and_send | payer=%s payer_type=%s" % [TAG, str(payer), str(typeof(payer))])
+
+	var ix = SystemProgram.transfer(payer, payer, 0)
+	print("%s _on_sign_and_send | instruction created ix=%s ix_type=%s" % [TAG, str(ix), str(typeof(ix))])
+
+	var tx := Transaction.new()
+	add_child(tx)
+	tx.set_payer(payer)
+	tx.add_instruction(ix)
+	print("%s _on_sign_and_send | transaction built, payer set, instruction added" % TAG)
+
+	# Fetch recent blockhash from RPC
+	print("%s _on_sign_and_send | fetching blockhash via tx.update_latest_blockhash()" % TAG)
+	status_label.text = "Fetching blockhash..."
+	tx.update_latest_blockhash()
+	var bh_result: Dictionary = await tx.blockhash_updated
+	print("%s _on_sign_and_send | blockhash_updated signal received result_keys=%s has_result=%s" % [TAG, str(bh_result.keys()), str(bh_result.has("result"))])
+	if bh_result.has("result"):
+		print("%s _on_sign_and_send | blockhash=%s" % [TAG, str(bh_result["result"]).substr(0, 80)])
+	else:
+		print("%s _on_sign_and_send | blockhash_error=%s" % [TAG, str(bh_result).substr(0, 120)])
+
+	if not bh_result.has("result"):
+		print("%s _on_sign_and_send | FAIL no blockhash in result — cannot build valid transaction" % TAG)
+		status_label.text = "Failed to fetch blockhash"
+		tx.queue_free()
+		_enable_buttons()
+		return
+
+	# Serialize, sign via MWA, then submit to network
+	var tx_bytes := tx.serialize()
+	print("%s _on_sign_and_send | serialized tx_bytes_size=%d tx_bytes_hex=%s" % [TAG, tx_bytes.size(), tx_bytes.hex_encode().substr(0, 40)])
+	status_label.text = "Approve in wallet..."
+
+	print("%s _on_sign_and_send | calling MWAManager.sign_and_send_transactions() with 1 tx" % TAG)
+	var sigs := await MWAManager.sign_and_send_transactions([tx_bytes])
+	tx.queue_free()
+
+	print("%s _on_sign_and_send | RESULT sigs_count=%d sigs=%s" % [TAG, sigs.size(), str(sigs).substr(0, 80)])
+	if sigs.is_empty():
+		print("%s _on_sign_and_send | FAIL no signatures returned from MWA" % TAG)
+		status_label.text = "Sign & send failed"
+	else:
+		print("%s _on_sign_and_send | SUCCESS first_sig=%s" % [TAG, str(sigs[0]).substr(0, 40)])
+		status_label.text = "Sent! Sig: " + str(sigs[0]).substr(0, 20) + "..."
 	_enable_buttons()
 	print("%s _on_sign_and_send | DONE" % TAG)
 
@@ -98,18 +190,6 @@ func _on_get_capabilities() -> void:
 			status_label.text += "  %s: %s\n" % [key, str(caps[key])]
 	_enable_buttons()
 	print("%s _on_get_capabilities | DONE" % TAG)
-
-
-func _on_reconnect() -> void:
-	print("%s _on_reconnect | START" % TAG)
-	_disable_buttons()
-	var success := await MWAManager.reauthorize()
-	print("%s _on_reconnect | DONE success=%s" % [TAG, str(success)])
-	if success:
-		status_label.text = "Reconnected successfully"
-	else:
-		status_label.text = "Reconnect failed"
-	_enable_buttons()
 
 
 func _on_disconnect() -> void:
@@ -137,12 +217,12 @@ func _on_status_updated(message: String) -> void:
 func _disable_buttons() -> void:
 	print("%s _disable_buttons | disabling all" % TAG)
 	for button in [sign_msg_button, sign_tx_button, sign_send_button,
-			capabilities_button, reconnect_button, disconnect_button, delete_button]:
+			capabilities_button, disconnect_button, delete_button]:
 		button.disabled = true
 
 
 func _enable_buttons() -> void:
 	print("%s _enable_buttons | enabling all" % TAG)
 	for button in [sign_msg_button, sign_tx_button, sign_send_button,
-			capabilities_button, reconnect_button, disconnect_button, delete_button]:
+			capabilities_button, disconnect_button, delete_button]:
 		button.disabled = false

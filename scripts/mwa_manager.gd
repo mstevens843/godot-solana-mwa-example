@@ -50,7 +50,6 @@ func _ready() -> void:
 	print("%s _ready | START" % TAG)
 	print("%s _ready | platform=%s app=%s cluster=%s" % [TAG, OS.get_name(), AppConfig.APP_NAME, AppConfig.CLUSTER])
 	_setup_wallet_adapter()
-	_dump_android_plugin_diagnostics()
 	print("%s _ready | DONE wallet_adapter_found=%s" % [TAG, str(wallet_adapter != null)])
 
 
@@ -147,6 +146,14 @@ func _setup_wallet_adapter() -> void:
 		wallet_adapter.clear_state()
 		print("%s _setup_wallet_adapter | clear_state() called" % TAG)
 
+	# Set Kotlin plugin identity vars so signing/transact works even after app restart + cache reconnect
+	if Engine.has_singleton("WalletAdapterAndroid"):
+		var cluster_map_k := {"devnet": 0, "mainnet-beta": 1, "testnet": 2}
+		var cluster_k: int = cluster_map_k.get(AppConfig.CLUSTER, 0)
+		var plugin = Engine.get_singleton("WalletAdapterAndroid")
+		plugin.call("setIdentity", cluster_k, AppConfig.APP_URI, AppConfig.APP_ICON_PATH, AppConfig.APP_NAME)
+		print("%s _setup_wallet_adapter | setIdentity called cluster=%d uri=%s icon=%s name=%s" % [TAG, cluster_k, AppConfig.APP_URI, AppConfig.APP_ICON_PATH, AppConfig.APP_NAME])
+
 	print("%s _setup_wallet_adapter | DONE signals connected" % TAG)
 
 
@@ -220,7 +227,6 @@ func authorize(wallet_type_id: int = -1) -> bool:
 	_pre_connect_key = _safe_get_key_string()
 	print("%s authorize | pre_connect_key='%s' (len=%d)" % [TAG, _pre_connect_key, _pre_connect_key.length()])
 	print("%s authorize | calling wallet_adapter.connect_wallet()" % TAG)
-	_dump_android_plugin_diagnostics()
 	status_updated.emit("Requesting wallet authorization...")
 	wallet_adapter.connect_wallet()
 
@@ -506,24 +512,102 @@ func sign_and_send_transactions(transactions: Array) -> Array:
 		status_updated.emit("Not connected")
 		return []
 
+	var has_plugin: bool = Engine.has_singleton("WalletAdapterAndroid")
+	print("%s sign_and_send_transactions | has_WalletAdapterAndroid=%s" % [TAG, str(has_plugin)])
+
+	if not has_plugin:
+		print("%s sign_and_send_transactions | FAIL plugin not available" % TAG)
+		status_updated.emit("Sign & send not available — plugin missing")
+		return []
+
+	var plugin = Engine.get_singleton("WalletAdapterAndroid")
 	status_updated.emit("Signing and sending %d transaction(s)..." % transactions.size())
 
-	# TODO: Use wallet-native signAndSendTransactions when SDK supports it
-	# For now, sign each and broadcast via RPC
-	print("%s sign_and_send_transactions | TODO — using individual sign fallback" % TAG)
+	# RPC URL for sendTransaction
+	var rpc_url_map := {"devnet": "https://api.devnet.solana.com", "mainnet-beta": "https://api.mainnet-beta.solana.com", "testnet": "https://api.testnet.solana.com"}
+	var rpc_url: String = rpc_url_map.get(AppConfig.CLUSTER, "https://api.devnet.solana.com")
+
 	var signatures: Array = []
 	for i in range(transactions.size()):
-		print("%s sign_and_send_transactions | signing tx %d/%d" % [TAG, i + 1, transactions.size()])
-		var sig := await sign_transaction(transactions[i])
-		if not sig.is_empty():
-			signatures.append(sig)
-			print("%s sign_and_send_transactions | tx %d signed sig=%s" % [TAG, i + 1, sig.substr(0, 16)])
-		else:
-			print("%s sign_and_send_transactions | tx %d FAILED" % [TAG, i + 1])
+		# Step 1: Sign via Kotlin plugin (MWA signTransactions — same approach as Unity SDK)
+		print("%s sign_and_send_transactions | tx %d/%d calling signAndSendTransaction (tx_bytes=%d)" % [TAG, i + 1, transactions.size(), transactions[i].size()])
+		status_updated.emit("Approve in wallet...")
+		plugin.call("signAndSendTransaction", transactions[i])
 
-	print("%s sign_and_send_transactions | DONE signed=%d/%d" % [TAG, signatures.size(), transactions.size()])
-	AndroidToastHelper.show("Sent %d transaction(s)" % signatures.size(), true)
-	status_updated.emit("Sent %d transaction(s)" % signatures.size())
+		# Poll for signed tx (Kotlin returns base64 signed tx, NOT a signature)
+		print("%s sign_and_send_transactions | POLLING tx %d for signed bytes (timeout=30s)" % [TAG, i + 1])
+		var elapsed := 0.0
+		while elapsed < 30.0:
+			await get_tree().create_timer(0.2).timeout
+			elapsed += 0.2
+			var poll_status = plugin.call("getSignAndSendStatus")
+			if poll_status != 0:
+				print("%s sign_and_send_transactions | POLL_DONE tx %d status=%d elapsed=%.1fs" % [TAG, i + 1, poll_status, elapsed])
+				break
+			if int(elapsed * 10) % 50 == 0 and elapsed > 0.5:
+				print("%s sign_and_send_transactions | POLL_TICK tx %d elapsed=%.1fs status=0 (waiting)" % [TAG, i + 1, elapsed])
+
+		var status = plugin.call("getSignAndSendStatus")
+		var base64_tx = str(plugin.call("getSignAndSendResult"))
+		print("%s sign_and_send_transactions | tx %d SIGN_RESULT status=%d base64_len=%d" % [TAG, i + 1, status, base64_tx.length()])
+
+		if status != 1 or base64_tx.is_empty():
+			print("%s sign_and_send_transactions | tx %d SIGN_FAILED status=%d" % [TAG, i + 1, status])
+			continue
+
+		# Step 2: Submit signed tx to Solana RPC via HTTPRequest (same as Unity SDK does)
+		print("%s sign_and_send_transactions | tx %d submitting to RPC %s" % [TAG, i + 1, rpc_url])
+		status_updated.emit("Sending to network...")
+
+		var http = HTTPRequest.new()
+		add_child(http)
+		var json_body := JSON.stringify({
+			"jsonrpc": "2.0",
+			"id": 1,
+			"method": "sendTransaction",
+			"params": [base64_tx, {"encoding": "base64", "skipPreflight": true, "preflightCommitment": "confirmed"}]
+		})
+		var headers := ["Content-Type: application/json"]
+		var err = http.request(rpc_url, headers, HTTPClient.METHOD_POST, json_body)
+		print("%s sign_and_send_transactions | tx %d HTTP request sent err=%d" % [TAG, i + 1, err])
+
+		if err != OK:
+			print("%s sign_and_send_transactions | tx %d HTTP_REQUEST_FAIL err=%d" % [TAG, i + 1, err])
+			http.queue_free()
+			continue
+
+		var response = await http.request_completed
+		http.queue_free()
+		var result_code: int = response[0]
+		var http_code: int = response[1]
+		var resp_headers = response[2]
+		var body: PackedByteArray = response[3]
+		var body_str := body.get_string_from_utf8()
+		print("%s sign_and_send_transactions | tx %d RPC response result=%d http=%d body_len=%d body=%s" % [TAG, i + 1, result_code, http_code, body_str.length(), body_str.substr(0, 200)])
+
+		# Parse response for tx signature
+		var json = JSON.new()
+		var parse_err = json.parse(body_str)
+		if parse_err == OK and json.data is Dictionary:
+			var rpc_result = json.data
+			if rpc_result.has("result") and rpc_result["result"] is String:
+				var tx_sig: String = rpc_result["result"]
+				signatures.append(tx_sig)
+				print("%s sign_and_send_transactions | tx %d SUCCESS tx_sig=%s sig_len=%d" % [TAG, i + 1, tx_sig, tx_sig.length()])
+			elif rpc_result.has("error"):
+				var rpc_err = rpc_result["error"]
+				print("%s sign_and_send_transactions | tx %d RPC_ERROR=%s" % [TAG, i + 1, str(rpc_err).substr(0, 200)])
+			else:
+				print("%s sign_and_send_transactions | tx %d UNEXPECTED response=%s" % [TAG, i + 1, body_str.substr(0, 200)])
+		else:
+			print("%s sign_and_send_transactions | tx %d JSON_PARSE_FAIL err=%d body=%s" % [TAG, i + 1, parse_err, body_str.substr(0, 100)])
+
+	print("%s sign_and_send_transactions | DONE sent=%d/%d" % [TAG, signatures.size(), transactions.size()])
+	if signatures.size() > 0:
+		AndroidToastHelper.show("Sent %d transaction(s)" % signatures.size(), true)
+		status_updated.emit("Sent! Sig: %s..." % str(signatures[0]).substr(0, 20))
+	else:
+		status_updated.emit("Sign & send failed")
 	transactions_sent.emit(signatures)
 	return signatures
 
@@ -540,17 +624,62 @@ func get_capabilities() -> Dictionary:
 
 	status_updated.emit("Querying wallet capabilities...")
 
-	# TODO: Use wallet_adapter.get_capabilities() when SDK supports it
-	print("%s get_capabilities | TODO — returning placeholder capabilities" % TAG)
+	# Call the real getCapabilities via the WalletAdapterAndroid plugin
+	var has_plugin: bool = Engine.has_singleton("WalletAdapterAndroid")
+	print("%s get_capabilities | has_WalletAdapterAndroid=%s" % [TAG, str(has_plugin)])
+
+	if has_plugin:
+		var plugin = Engine.get_singleton("WalletAdapterAndroid")
+		print("%s get_capabilities | plugin=%s calling getCapabilitiesWallet()" % [TAG, str(plugin)])
+		plugin.call("getCapabilitiesWallet")
+
+		# Poll for result (the Kotlin plugin opens a wallet activity)
+		print("%s get_capabilities | POLLING for result (timeout=30s)" % TAG)
+		var elapsed := 0.0
+		while elapsed < 30.0:
+			await get_tree().create_timer(0.2).timeout
+			elapsed += 0.2
+			var poll_status = plugin.call("getCapabilitiesStatus")
+			if poll_status != 0:
+				print("%s get_capabilities | POLL_DONE status=%d elapsed=%.1fs" % [TAG, poll_status, elapsed])
+				break
+			if int(elapsed * 10) % 50 == 0 and elapsed > 0.5:
+				print("%s get_capabilities | POLL_TICK elapsed=%.1fs status=0 (still waiting)" % [TAG, elapsed])
+
+		var status = plugin.call("getCapabilitiesStatus")
+		var result_str = plugin.call("getCapabilitiesResult")
+		print("%s get_capabilities | FINAL_STATUS=%d result_str_len=%d result_str='%s'" % [TAG, status, str(result_str).length(), str(result_str).substr(0, 120)])
+
+		if status == 1 and not str(result_str).is_empty():
+			# Parse the comma-separated key=value string from Kotlin
+			var caps := {}
+			var parts = str(result_str).split(",")
+			print("%s get_capabilities | parsing %d key=value pairs" % [TAG, parts.size()])
+			for part in parts:
+				var kv = part.split("=", true, 1)
+				if kv.size() == 2:
+					caps[kv[0]] = kv[1]
+					print("%s get_capabilities | PARSED key='%s' value='%s'" % [TAG, kv[0], kv[1]])
+				else:
+					print("%s get_capabilities | SKIP malformed part='%s'" % [TAG, part])
+			print("%s get_capabilities | DONE total_caps=%d caps=%s" % [TAG, caps.size(), str(caps)])
+			AndroidToastHelper.show("Capabilities received from wallet")
+			status_updated.emit("Capabilities received")
+			capabilities_received.emit(caps)
+			return caps
+		else:
+			print("%s get_capabilities | FAIL status=%d result_empty=%s elapsed=%.1fs" % [TAG, status, str(str(result_str).is_empty()), elapsed])
+			status_updated.emit("Failed to get capabilities")
+			return {}
+
+	# Fallback: hardcoded defaults if plugin not available
+	print("%s get_capabilities | FALLBACK — plugin not available, returning defaults" % TAG)
 	var caps := {
 		"max_transactions_per_request": 10,
 		"max_messages_per_request": 10,
 		"supported_transaction_versions": ["legacy", 0],
 	}
-
-	print("%s get_capabilities | DONE max_txs=%d max_msgs=%d" % [TAG, caps["max_transactions_per_request"], caps["max_messages_per_request"]])
-	AndroidToastHelper.show("Capabilities: max_txs=%d max_msgs=%d" % [caps["max_transactions_per_request"], caps["max_messages_per_request"]])
-	status_updated.emit("Capabilities received")
+	status_updated.emit("Capabilities (defaults)")
 	capabilities_received.emit(caps)
 	return caps
 

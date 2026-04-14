@@ -71,11 +71,6 @@ layout_mode = 2
 custom_minimum_size = Vector2(300, 44)
 text = "Get Capabilities"
 
-[node name="ReconnectButton" type="Button" parent="VBoxContainer/ButtonGrid"]
-layout_mode = 2
-custom_minimum_size = Vector2(300, 44)
-text = "Reconnect"
-
 [node name="HSeparator2" type="HSeparator" parent="VBoxContainer"]
 layout_mode = 2
 

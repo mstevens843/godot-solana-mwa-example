@@ -137,6 +137,72 @@ The **Reconnect (cached)** button does NOT call `clearState()` — it reads the 
 | `GDExtensionAndroidPlugin.kt` | `clearState()` now sets `myResult = null` + logging |
 | `GDExtensionAndroidPlugin.kt` | `connectWallet()` — added logging for CACHED vs FRESH |
 | `GDExtensionAndroidPlugin.kt` | `getConnectionStatus()` — removed per-frame log spam |
+| `GDExtensionAndroidPlugin.kt` | Added `getCapabilitiesWallet()`, `getCapabilitiesStatus()`, `getCapabilitiesResult()` |
+| `MyComposable.kt` | Added `myCapabilitiesResult`/`myCapabilitiesStatus` vars + `getWalletCapabilities()` Composable |
+| `MyComponentActivity.kt` | Added `myAction == 3` routing for getCapabilities |
+
+---
+
+## SDK Fix #2: `getCapabilities()` — Query Wallet Capabilities
+
+The MWA 2.0 spec includes `get_capabilities` for querying wallet limits and supported features. The Godot SDK did not expose this method. We added it to the Kotlin plugin.
+
+### Root Cause
+
+`GDExtensionAndroidPlugin.kt` had no `getCapabilities` method. The MWA client library (`mobile-wallet-adapter-clientlib-ktx:2.0.3`) has `getCapabilities()` available inside `walletAdapter.transact{}`, but the Godot plugin never called it.
+
+### Changes
+
+**MyComposable.kt** — Added static vars and Composable function:
+```kotlin
+var myCapabilitiesResult: String = ""
+var myCapabilitiesStatus: Int = 0  // 0=pending, 1=success, 2=failed
+
+@Composable
+fun getWalletCapabilities(sender: ActivityResultSender) {
+    // Opens MWA session, calls getCapabilities(), stores result as key=value string
+    val result = walletAdapter.transact(sender) { getCapabilities() }
+    // Stores: maxTransactions, maxMessages, supportsCloneAuth, supportsSignAndSend,
+    //         supportedVersions, optionalFeatures
+}
+```
+
+**MyComponentActivity.kt** — Added action routing:
+```kotlin
+else if (myAction == 3) {
+    val sender = ActivityResultSender(this)
+    setContent { getWalletCapabilities(sender) }
+}
+```
+
+**GDExtensionAndroidPlugin.kt** — Added trigger and getters:
+```kotlin
+@UsedByGodot
+fun getCapabilitiesWallet()  // Sets myAction=3, launches ComposeWalletActivity
+
+@UsedByGodot
+fun getCapabilitiesStatus(): Int  // 0=pending, 1=success, 2=failed
+
+@UsedByGodot
+fun getCapabilitiesResult(): String  // Comma-separated key=value pairs
+```
+
+### Return Values
+
+The `GetCapabilitiesResult` from the MWA client contains:
+- `maxTransactionsPerSigningRequest` (int)
+- `maxMessagesPerSigningRequest` (int)
+- `supportsCloneAuthorization` (boolean)
+- `supportsSignAndSendTransactions` (boolean)
+- `supportedTransactionVersions` (Object[])
+- `supportedOptionalFeatures` (String[])
+
+### GDScript Usage
+
+```gdscript
+var caps := await MWAManager.get_capabilities()
+# caps = { "maxTransactions": "10", "maxMessages": "10", "supportsCloneAuth": "false", ... }
+```
 
 ---
 

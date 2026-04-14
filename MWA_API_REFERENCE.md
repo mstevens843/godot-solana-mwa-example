@@ -299,12 +299,24 @@ val result = walletAdapter.transact(sender) { authResult ->
 val txSig = result.successPayload?.signatures?.first()
 ```
 
-### Godot SDK (current)
+### Godot SDK (implemented in example app)
 ```gdscript
-# NOT DIRECTLY AVAILABLE as signAndSendTransactions
-# Workaround: sign transaction, then submit via RPC separately
-wallet_adapter.sign_message(serialized_tx_bytes, 0)
-# Wait for message_signed signal, then submit signature via SolanaClient RPC
+# Build a transaction using the SDK's C++ classes
+var payer := Pubkey.new_from_string(connected_pubkey)
+var ix := SystemProgram.transfer(payer, payer, 0)
+var tx := Transaction.new()
+tx.set_payer(payer)
+tx.add_instruction(ix)
+tx.update_latest_blockhash()
+var bh_result: Dictionary = await tx.blockhash_updated
+
+# Sign via MWA and collect signatures
+var tx_bytes := tx.serialize()
+var sigs := await MWAManager.sign_and_send_transactions([tx_bytes])
+# sigs is an Array of signature hex strings
+
+# Internally, sign_and_send_transactions calls wallet_adapter.sign_message(tx_bytes, 0)
+# for each transaction and collects the signed results
 ```
 
 ---
@@ -315,10 +327,23 @@ wallet_adapter.sign_message(serialized_tx_bytes, 0)
 
 **Type:** Privileged, Optional (for backward compatibility only)
 
-### Godot SDK
+### Godot SDK (implemented in example app)
 ```gdscript
-wallet_adapter.sign_message(serialized_tx_bytes, signer_index)
-# Wait for message_signed signal
+# Build a transaction using SDK C++ classes, serialize, sign via MWA
+var payer := Pubkey.new_from_string(connected_pubkey)
+var ix := SystemProgram.transfer(payer, payer, 0)
+var tx := Transaction.new()
+tx.set_payer(payer)
+tx.add_instruction(ix)
+tx.update_latest_blockhash()
+await tx.blockhash_updated
+
+var tx_bytes := tx.serialize()
+var sig := await MWAManager.sign_transaction(tx_bytes)
+# sig is a hex-encoded Ed25519 signature string (128 chars)
+
+# Internally calls wallet_adapter.sign_message(tx_bytes, 0)
+# Waits for message_signed signal, returns signature
 ```
 
 ---
@@ -341,10 +366,21 @@ wallet_adapter.sign_message(serialized_tx_bytes, signer_index)
 
 **Mandatory features** (`solana:signMessages`, `solana:signAndSendTransaction`) are NOT listed — they're always present.
 
-### Godot SDK
+### Godot SDK (implemented via SDK plugin fix)
 ```gdscript
-# NOT EXPOSED — wallet_adapter.has_method("get_capabilities") returns false
-# Placeholder implementation returns hardcoded values
+# Calls the real MWA getCapabilities via the Kotlin plugin
+var caps := await MWAManager.get_capabilities()
+# Returns Dictionary with keys:
+#   maxTransactions — max transactions per signing request
+#   maxMessages — max messages per signing request
+#   supportsCloneAuth — whether wallet supports clone authorization
+#   supportsSignAndSend — whether wallet supports sign and send
+#   supportedVersions — transaction versions (e.g. "legacy;0")
+#   optionalFeatures — optional MWA features supported
+
+# Implementation: added getCapabilitiesWallet() to GDExtensionAndroidPlugin.kt
+# which calls walletAdapter.transact { getCapabilities() } via MWA client
+# Results stored as comma-separated key=value string, parsed in GDScript
 ```
 
 ---
@@ -413,14 +449,14 @@ wallet_adapter.sign_text_message("Sign in to My App")
 
 | MWA 2.0 Spec | React Native | Kotlin | Godot SDK | Status |
 |---------------|-------------|--------|-----------|--------|
-| `authorize` | `wallet.authorize()` | `walletAdapter.connect()` | `wallet_adapter.connect_wallet()` | Partial — no auth_token, no SIWS |
-| `deauthorize` | `wallet.deauthorize()` | `walletAdapter.disconnect()` | **NOT EXPOSED** | Missing |
-| `sign_messages` | `wallet.signMessages()` | `signMessagesDetached()` | `wallet_adapter.sign_text_message()` | Works — text only |
-| `sign_and_send_transactions` | `wallet.signAndSendTransactions()` | `signAndSendTransactions()` | **NOT EXPOSED** | Missing — sign only via `sign_message()` |
-| `sign_transactions` | `wallet.signTransactions()` | N/A (deprecated) | `wallet_adapter.sign_message(bytes, idx)` | Works |
-| `get_capabilities` | `wallet.getCapabilities()` | N/A | **NOT EXPOSED** | Missing |
-| `reauthorize` | `authorize({auth_token})` | Internal | **NOT EXPOSED** | Missing — no auth_token access |
-| SIWS | `authorize({sign_in_payload})` | `walletAdapter.signIn()` | **NOT EXPOSED** | Missing |
+| `authorize` | `wallet.authorize()` | `walletAdapter.connect()` | `wallet_adapter.connect_wallet()` | Working — clearState() fix enables proper disconnect/reconnect |
+| `deauthorize` | `wallet.deauthorize()` | `walletAdapter.disconnect()` | `clearState()` + local state clear | Working — via SDK plugin fix (PR #449) |
+| `sign_messages` | `wallet.signMessages()` | `signMessagesDetached()` | `wallet_adapter.sign_text_message()` | Working — Seed Vault biometric, Phantom in-app approval |
+| `sign_and_send_transactions` | `wallet.signAndSendTransactions()` | `signAndSendTransactions()` | Kotlin `signTransactions()` + GDScript RPC `sendTransaction` | Working — signs via MWA, submits via app-side RPC (same as Unity SDK) |
+| `sign_transactions` | `wallet.signTransactions()` | N/A (deprecated) | `wallet_adapter.sign_message(bytes, 0)` | Working — builds real tx, signs via MWA |
+| `get_capabilities` | `wallet.getCapabilities()` | `getCapabilities()` | `getCapabilitiesWallet()` via plugin | Working — added to SDK Kotlin plugin |
+| `reauthorize` | `authorize({auth_token})` | Internal | AuthCache-based reconnect | Working — reads cached pubkey directly |
+| SIWS | `authorize({sign_in_payload})` | `walletAdapter.signIn()` | **NOT EXPOSED** | Missing — SDK does not support sign_in_payload |
 
 ---
 
@@ -454,15 +490,23 @@ wallet_adapter.sign_text_message("Sign in to My App")
 
 ---
 
-## SDK Gaps (Grant Deliverables)
+## SDK Gaps — Fixed
 
-These are the methods that need to be added to the Godot SDK to reach API parity with React Native:
+These methods were missing from the Godot SDK. We fixed them via Kotlin plugin modifications and GDScript workarounds:
 
-1. **`deauthorize(auth_token)`** — revoke authorization
-2. **`get_auth_token()`** — expose auth_token from authorize response
-3. **`get_capabilities()`** — query wallet capabilities
-4. **`sign_and_send_transactions()`** — sign + submit in one call
-5. **`authorize({sign_in_payload})`** — SIWS support
-6. **`authorize({auth_token})`** — silent reauthorization
-7. **Expose `clear_state()` to GDScript** — currently C++ only
-8. **`wallet_uri_base`** — expose from authorize response
+| Gap | Status | How |
+|-----|--------|-----|
+| `clearState()` not resetting connection | **Fixed** | Added `myResult = null` to `clearState()` in Kotlin plugin ([PR #449](https://github.com/Virus-Axel/godot-solana-sdk/pull/449)) |
+| `get_capabilities()` not exposed | **Fixed** | Added `getCapabilitiesWallet()` to Kotlin plugin, calls MWA `getCapabilities()` via `transact{}` |
+| `sign_and_send_transactions()` not exposed | **Working** | Signs via Kotlin `signTransactions()` composable, submits to Solana RPC via GDScript HTTPRequest. Kotlin MWA clientlib's `signAndSendTransactions()` is broken with Phantom (times out), so we use the Unity SDK approach: sign via wallet, send via app-side RPC. |
+| `sign_transactions()` not working | **Working** | Builds real Transaction, fetches blockhash, serializes, signs via MWA `wallet_adapter.sign_message(bytes, 0)` |
+| `deauthorize` not exposed | **Working** | `clearState()` + destroy/recreate WalletAdapter + clear local GDScript state |
+| `reauthorize` (silent reconnect) | **Working** | AuthCache reads cached pubkey directly, no SDK call needed |
+
+## SDK Gaps — Remaining (require deeper SDK changes)
+
+1. **`get_auth_token()`** — auth_token stored in Kotlin static var but not exposed through C++ to GDScript
+2. **`authorize({sign_in_payload})`** — SIWS support requires changes to `connectWallet()` in both Kotlin and C++
+3. **`authorize({auth_token})`** — silent reauthorization requires passing auth_token through C++ layer
+4. **`wallet_uri_base`** — available in Kotlin `AuthorizationResult` but not read or stored
+5. **`transact()` session model** — SDK opens separate MWA sessions per method call instead of one session for all operations
