@@ -224,15 +224,18 @@ func authorize(wallet_type_id: int = -1) -> bool:
 	print("%s authorize | adapter recreated — fresh session" % TAG)
 
 	# ── CHECK FOR SIWS ONE-SHOT (non-Seed-Vault with known wallet type) ──
-	var use_siws := wallet_type_id >= 0 and Engine.has_singleton("WalletAdapterAndroid")
+	var use_siws := Engine.has_singleton("WalletAdapterAndroid")
 	print("%s authorize | SIWS_CHECK use_siws=%s wallet_type_id=%d has_plugin=%s" % [TAG, str(use_siws), wallet_type_id, str(Engine.has_singleton("WalletAdapterAndroid"))])
 
 	if use_siws:
 		var siws_result := await _authorize_siws(wallet_type_id)
 		_waiting_for_connection = false
-		return siws_result
+		if siws_result:
+			return true
+		# SIWS failed (Seed Vault doesn't support it) — fall through to legacy path
+		print("%s authorize | SIWS_FAILED — falling back to legacy connect_wallet()" % TAG)
 
-	# ── LEGACY PATH (Seed Vault, OS picker, no plugin) ──
+	# ── LEGACY PATH (Seed Vault, no plugin, or SIWS fallback) ──
 	# Snapshot current key BEFORE connect
 	_pre_connect_key = _safe_get_key_string()
 	print("%s authorize | pre_connect_key='%s' (len=%d)" % [TAG, _pre_connect_key, _pre_connect_key.length()])
