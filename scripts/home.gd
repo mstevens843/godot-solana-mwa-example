@@ -166,6 +166,7 @@ func _on_sign_and_send() -> void:
 
 	print("%s _on_sign_and_send | calling MWAManager.sign_and_send_transactions() with 1 tx" % TAG)
 	var sigs := await MWAManager.sign_and_send_transactions([tx_bytes])
+	print("%s _on_sign_and_send | AWAIT_RETURNED sigs_type=%s sigs_count=%d" % [TAG, str(typeof(sigs)), sigs.size()])
 	tx.queue_free()
 
 	print("%s _on_sign_and_send | RESULT sigs_count=%d sigs=%s" % [TAG, sigs.size(), str(sigs).substr(0, 80)])

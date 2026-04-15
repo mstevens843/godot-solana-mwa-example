@@ -638,39 +638,54 @@ func sign_and_send_transactions(transactions: Array) -> Array:
 		var tx_bytes: PackedByteArray = transactions[i]
 		print("%s sign_and_send_transactions | tx %d/%d ENTRY tx_bytes_size=%d tx_hex=%s" % [TAG, i + 1, transactions.size(), tx_bytes.size(), tx_bytes.hex_encode().substr(0, 80)])
 
-		# Reset status before each tx (Kotlin plugin uses global state)
-		print("%s sign_and_send_transactions | tx %d calling plugin.signAndSendTransaction()" % [TAG, i + 1])
+		# STEP 1: Reset Kotlin global state before each tx — critical!
+		# Without this, myMessageSigningStatus stays non-zero from prior sign_message/sign_transaction,
+		# causing the poll loop to exit immediately with a stale result.
+		print("%s sign_and_send_transactions | STEP_1 tx %d/%d PRE_CLEAR — calling clearState() to reset myMessageSigningStatus" % [TAG, i + 1, transactions.size()])
+		plugin.call("clearState")
+		print("%s sign_and_send_transactions | STEP_2 tx %d clearState() DONE — status should now be 0" % [TAG, i + 1])
+
+		# STEP 3: Verify status is actually 0 after clearState
+		var pre_status: int = plugin.call("getSignAndSendStatus")
+		print("%s sign_and_send_transactions | STEP_3 tx %d POST_CLEAR status=%d (must be 0)" % [TAG, i + 1, pre_status])
+		if pre_status != 0:
+			print("%s sign_and_send_transactions | STEP_3 WARNING tx %d clearState did NOT reset status to 0 — stale=%d" % [TAG, i + 1, pre_status])
+
+		# STEP 4: Call signAndSendTransaction on the Kotlin plugin
+		print("%s sign_and_send_transactions | STEP_4 tx %d calling plugin.signAndSendTransaction() tx_bytes_size=%d" % [TAG, i + 1, tx_bytes.size()])
 		status_updated.emit("Approve tx %d/%d in wallet..." % [i + 1, transactions.size()])
 		plugin.call("signAndSendTransaction", tx_bytes)
+		print("%s sign_and_send_transactions | STEP_4 tx %d signAndSendTransaction() CALLED — wallet activity should launch" % [TAG, i + 1])
 
-		# Poll for wallet result (wallet signs + broadcasts, returns signature)
-		print("%s sign_and_send_transactions | tx %d POLLING for wallet result (timeout=60s)" % [TAG, i + 1])
+		# STEP 5: Poll for wallet result (wallet signs + broadcasts, returns signature)
+		print("%s sign_and_send_transactions | STEP_5 tx %d POLLING start (timeout=60s, interval=0.3s)" % [TAG, i + 1])
 		var elapsed := 0.0
 		while elapsed < 60.0:
 			await get_tree().create_timer(0.3).timeout
 			elapsed += 0.3
 			var poll_status: int = plugin.call("getSignAndSendStatus")
 			if poll_status != 0:
-				print("%s sign_and_send_transactions | tx %d POLL_DONE status=%d elapsed=%.1fs" % [TAG, i + 1, poll_status, elapsed])
+				print("%s sign_and_send_transactions | STEP_5 tx %d POLL_EXIT status=%d elapsed=%.1fs" % [TAG, i + 1, poll_status, elapsed])
 				break
 			if int(elapsed * 10) % 50 == 0 and elapsed > 0.5:
-				print("%s sign_and_send_transactions | tx %d POLL_TICK elapsed=%.1fs status=0 (wallet pending)" % [TAG, i + 1, elapsed])
+				print("%s sign_and_send_transactions | STEP_5 tx %d POLL_TICK elapsed=%.1fs status=0 (wallet pending)" % [TAG, i + 1, elapsed])
 
+		# STEP 6: Read final status
 		var final_status: int = plugin.call("getSignAndSendStatus")
-		print("%s sign_and_send_transactions | tx %d FINAL_STATUS=%d elapsed=%.1fs" % [TAG, i + 1, final_status, elapsed])
+		print("%s sign_and_send_transactions | STEP_6 tx %d FINAL_STATUS=%d elapsed=%.1fs" % [TAG, i + 1, final_status, elapsed])
 
 		if final_status == 1:
-			# Wallet signed + broadcast successfully — get the signature bytes
+			# STEP 7: Wallet signed + broadcast successfully — get the signature bytes
 			var sig_bytes: PackedByteArray = plugin.call("getSignAndSendResult")
 			var sig_hex: String = sig_bytes.hex_encode()
-			print("%s sign_and_send_transactions | tx %d SUCCESS sig_bytes_size=%d sig_hex=%s" % [TAG, i + 1, sig_bytes.size(), sig_hex])
+			print("%s sign_and_send_transactions | STEP_7 tx %d SUCCESS sig_bytes_size=%d sig_hex=%s" % [TAG, i + 1, sig_bytes.size(), sig_hex])
 			signatures.append(sig_hex)
 		elif final_status == 0:
-			print("%s sign_and_send_transactions | tx %d TIMEOUT elapsed=%.1fs — wallet never responded" % [TAG, i + 1, elapsed])
+			print("%s sign_and_send_transactions | STEP_7 tx %d TIMEOUT elapsed=%.1fs — wallet never responded" % [TAG, i + 1, elapsed])
 		else:
-			print("%s sign_and_send_transactions | tx %d FAILED status=%d — wallet rejected or error" % [TAG, i + 1, final_status])
+			print("%s sign_and_send_transactions | STEP_7 tx %d FAILED status=%d — wallet rejected or error" % [TAG, i + 1, final_status])
 
-	print("%s sign_and_send_transactions | DONE sent=%d/%d signatures=%s" % [TAG, signatures.size(), transactions.size(), str(signatures).substr(0, 200)])
+	print("%s sign_and_send_transactions | STEP_8 DONE sent=%d/%d signatures=%s" % [TAG, signatures.size(), transactions.size(), str(signatures).substr(0, 200)])
 	if signatures.size() > 0:
 		AndroidToastHelper.show("Sent %d transaction(s)" % signatures.size(), true)
 		status_updated.emit("Sent! Sig: %s..." % str(signatures[0]).substr(0, 20))
