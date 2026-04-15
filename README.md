@@ -4,7 +4,7 @@ Minimal Godot 4.x Android app demonstrating all Solana Mobile Wallet Adapter (MW
 
 ## What This Project Does
 
-Brought the Godot Mobile Wallet Adapter SDK to parity with the React Native SDK. Found and fixed 10 integration bugs during testing, submitted a `clearState()` SDK fix ([PR #449](https://github.com/Virus-Axel/godot-solana-sdk/pull/449)) to enable proper disconnect/reconnect flows. Built a complete example app verified on Solana Seeker hardware with all five MWA wallet providers. All flows working: connect, disconnect, reconnect fresh, reconnect cached, delete account, sign message.
+Brought the Godot Mobile Wallet Adapter SDK to parity with the React Native SDK. All 8 MWA 2.0 API methods working: authorize, deauthorize, reauthorize, sign message, sign transaction, sign & send transaction, get capabilities, delete account. Found and fixed 10 integration bugs during testing. Built `getCapabilities` from scratch in the SDK Kotlin plugin (did not exist). Submitted SDK fixes via [PR #449](https://github.com/Virus-Axel/godot-solana-sdk/pull/449). Verified on Solana Seeker hardware with Phantom, Seed Vault, Solflare, Backpack, Jupiter.
 
 Related: [Issue #445 - 10 bugs found during integration](https://github.com/Virus-Axel/godot-solana-sdk/issues/445)
 
@@ -25,25 +25,37 @@ Related: [Issue #445 - 10 bugs found during integration](https://github.com/Viru
 
 ## Wallet Support
 
-| Wallet | Connect | Disconnect | Reconnect (Fresh) | Reconnect (Cached) | Sign Message | Delete Account |
-|--------|---------|------------|-------------------|-------------------|--------------|----------------|
-| Seed Vault | Yes | Yes | Yes | Yes | Yes (biometric) | Yes (biometric) |
-| Phantom | Yes | Yes | Yes | Yes | Skipped (SDK session limit) | Yes (sign confirmation) |
-| Solflare | Yes | Yes | Yes | Yes | Skipped (SDK session limit) | Yes (connect confirmation) |
-| Backpack | Yes | Yes | Yes | Yes | Skipped (SDK session limit) | Yes (sign confirmation) |
-| Jupiter | Yes | Yes | Yes | Yes | Skipped (SDK session limit) | Yes (sign confirmation) |
+| Wallet | Connect | Disconnect | Reconnect | Sign Msg | Sign Tx | Sign & Send | Get Caps | Delete |
+|--------|---------|------------|-----------|----------|---------|-------------|----------|--------|
+| Seed Vault | Yes | Yes | Yes | Yes (biometric) | Yes | Yes | Yes | Yes (biometric) |
+| Phantom | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Solflare | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Backpack | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Jupiter | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 
 Non-Seed-Vault wallets skip the sign-in step during authorize because the Godot SDK opens a separate MWA session for each method call. `sign_text_message()` in a new unauthorized session fails on these wallets. This is a known SDK limitation documented in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
-## SDK Fix: clearState()
+## SDK Additions to godot-solana-sdk
 
-The core SDK fix that makes disconnect/reconnect work. Without this, `connectWallet()` silently returns the cached connection after the first connect and never opens the OS picker again.
+All SDK changes are in the Kotlin plugin layer (`GDExtensionAndroidPlugin.kt`, `MyComposable.kt`, `MyComponentActivity.kt`).
 
-**Root cause:** `clearState()` only reset `myMessageSigningStatus` but did not clear `myResult`. The `connectWallet()` function checks `if (myResult is TransactionResult.Success) { return }` and skips the wallet picker entirely.
+**PR:** [#449](https://github.com/Virus-Axel/godot-solana-sdk/pull/449)
 
-**Fix:** Added `myResult = null` to `clearState()` in `GDExtensionAndroidPlugin.kt`. Full writeup: [SDK_CLEARSTATE_FIX.md](SDK_CLEARSTATE_FIX.md)
+### getCapabilities (built from scratch — did not exist in SDK)
 
-**PR:** [#449 - fix: clearState() now resets myResult to enable disconnect/reconnect](https://github.com/Virus-Axel/godot-solana-sdk/pull/449)
+Added `getCapabilitiesWallet()` method that opens an MWA session via `transact { getCapabilities() }` and returns wallet capabilities: `maxTransactions`, `maxMessages`, `supportsCloneAuth`, `supportsSignAndSend`, `supportedVersions`, `optionalFeatures`. Results polled via `getCapabilitiesStatus()` / `getCapabilitiesResult()`.
+
+### clearState() fix
+
+`clearState()` only reset `myMessageSigningStatus` but did not clear `myResult`. `connectWallet()` checks `if (myResult is TransactionResult.Success) { return }` and skips the wallet picker. Fix: added `myResult = null`. Full writeup: [SDK_CLEARSTATE_FIX.md](SDK_CLEARSTATE_FIX.md)
+
+### setIdentity()
+
+Added `setIdentity(cluster, uri, icon, name)` to initialize Kotlin static identity vars on app startup. Without this, signing crashes with `IllegalArgumentException: identityUri must be absolute` after app restart + cached reconnect (Kotlin vars reset to defaults but GDScript reconnects without calling `connectWallet()`).
+
+### Auth token caching
+
+`signTransaction` and `signTextMessage` composables now save `authToken = result.authResult.authToken` on success, so subsequent operations reuse the wallet authorization.
 
 ## Prerequisites
 
@@ -155,11 +167,13 @@ adb logcat -c && adb logcat | grep -E "\[MWAManager\]|\[AuthCache\]|\[Main\]|\[H
 |------|----------------|
 | Connect | OS wallet picker opens, select wallet, approve, lands on Home screen |
 | Sign Message | Wallet opens for signing approval, signature returned |
+| Sign Transaction | Builds 0-lamport SOL self-transfer, wallet signs, signature displayed |
+| Sign & Send Transaction | Wallet signs, app submits to Solana RPC, on-chain tx signature returned |
+| Get Capabilities | Queries wallet, displays maxTransactions, maxMessages, supportedVersions |
 | Disconnect | Returns to landing page, Reconnect (cached) button appears |
 | Reconnect (cached) | Instant reconnect using AuthCache, no wallet interaction |
 | Connect (after disconnect) | `clearState()` called, OS picker opens fresh |
 | Delete Account | Sign confirmation in wallet, cache cleared, returns to landing page |
-| Connect (after delete) | `clearState()` called, OS picker opens fresh, clean slate |
 
 ## Documentation
 

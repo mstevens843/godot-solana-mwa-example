@@ -19,3 +19,6 @@ addons/SolanaSDK/bin/*.so
 addons/SolanaSDK/bin/*.dll
 addons/SolanaSDK/bin/*.dylib
 addons/SolanaSDK/bin/*.wasm
+
+# Internal planning docs
+SDK_FUTURE_IMPLEMENTATIONS.md

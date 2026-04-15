@@ -123,14 +123,17 @@ func _on_sign_and_send() -> void:
 	_disable_buttons()
 	status_label.text = "Building transaction..."
 
-	# Build a minimal 0-lamport SOL transfer to self (harmless demo tx)
+	# Build a small SOL transfer to self (~0.0001 SOL = 100000 lamports)
+	# signAndSendTransactions requires a real broadcastable tx — 0-lamport transfers
+	# cause wallets to crash (Backpack: "Cannot read property 'err' of undefined")
+	# or silently fail (Phantom: hangs without showing approval UI).
 	var pubkey_str := MWAManager.connected_pubkey
 	print("%s _on_sign_and_send | creating Pubkey from '%s' (len=%d)" % [TAG, pubkey_str, pubkey_str.length()])
 	var payer = Pubkey.new_from_string(pubkey_str)
 	print("%s _on_sign_and_send | payer=%s payer_type=%s" % [TAG, str(payer), str(typeof(payer))])
 
-	var ix = SystemProgram.transfer(payer, payer, 0)
-	print("%s _on_sign_and_send | instruction created ix=%s ix_type=%s" % [TAG, str(ix), str(typeof(ix))])
+	var ix = SystemProgram.transfer(payer, payer, 100000)
+	print("%s _on_sign_and_send | instruction created ix=%s ix_type=%s lamports=100000" % [TAG, str(ix), str(typeof(ix))])
 
 	var tx := Transaction.new()
 	add_child(tx)

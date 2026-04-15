@@ -223,6 +223,16 @@ func authorize(wallet_type_id: int = -1) -> bool:
 		print("%s authorize | re-applied wallet_type=%d after recreation" % [TAG, wallet_type_id])
 	print("%s authorize | adapter recreated — fresh session" % TAG)
 
+	# ── CHECK FOR SIWS ONE-SHOT (non-Seed-Vault with known wallet type) ──
+	var use_siws := wallet_type_id >= 0 and Engine.has_singleton("WalletAdapterAndroid")
+	print("%s authorize | SIWS_CHECK use_siws=%s wallet_type_id=%d has_plugin=%s" % [TAG, str(use_siws), wallet_type_id, str(Engine.has_singleton("WalletAdapterAndroid"))])
+
+	if use_siws:
+		var siws_result := await _authorize_siws(wallet_type_id)
+		_waiting_for_connection = false
+		return siws_result
+
+	# ── LEGACY PATH (Seed Vault, OS picker, no plugin) ──
 	# Snapshot current key BEFORE connect
 	_pre_connect_key = _safe_get_key_string()
 	print("%s authorize | pre_connect_key='%s' (len=%d)" % [TAG, _pre_connect_key, _pre_connect_key.length()])
@@ -406,6 +416,99 @@ func deauthorize() -> void:
 	disconnected.emit()
 
 
+## ─── AUTHORIZE SIWS (MWA 2.0 one-shot) ──────────────────────────────────────
+
+## SIWS authorize: connect + prove ownership in one MWA session.
+## Used for non-Seed-Vault wallets (Phantom, Solflare, Backpack, etc.).
+## Calls the Kotlin plugin directly (bypasses C++ WalletAdapter for the connect step).
+## After success, Kotlin globals (myConnectedKey, authToken) are set, so subsequent
+## sign_message/sign_transaction calls through the WalletAdapter will work.
+func _authorize_siws(wallet_type_id: int) -> bool:
+	print("%s _authorize_siws | START wallet_type_id=%d (%s)" % [TAG, wallet_type_id, _wallet_type_name(wallet_type_id)])
+
+	var plugin = Engine.get_singleton("WalletAdapterAndroid")
+	var cluster_map := {"devnet": 0, "mainnet-beta": 1, "testnet": 2}
+	var cluster_val: int = cluster_map.get(AppConfig.CLUSTER, 0)
+	var domain := AppConfig.APP_URI
+	var statement := "Sign in to %s" % AppConfig.APP_NAME
+
+	print("%s _authorize_siws | CALLING connectWalletSiws cluster=%d uri=%s icon=%s name=%s domain=%s statement=%s" % [TAG, cluster_val, AppConfig.APP_URI, AppConfig.APP_ICON_PATH, AppConfig.APP_NAME, domain, statement])
+	status_updated.emit("Requesting wallet authorization (SIWS)...")
+	plugin.call("connectWalletSiws", cluster_val, AppConfig.APP_URI, AppConfig.APP_ICON_PATH, AppConfig.APP_NAME, domain, statement)
+
+	# Poll for SIWS result from Kotlin plugin
+	print("%s _authorize_siws | POLLING for SIWS result (timeout=60s)" % TAG)
+	var elapsed := 0.0
+	while elapsed < 60.0:
+		await get_tree().create_timer(0.5).timeout
+		elapsed += 0.5
+		var poll_status: int = plugin.call("getSiwsStatus")
+		if poll_status != 0:
+			print("%s _authorize_siws | POLL_DONE status=%d elapsed=%.1fs" % [TAG, poll_status, elapsed])
+			break
+		if int(elapsed) % 5 == 0 and elapsed > 0.5:
+			print("%s _authorize_siws | POLL_TICK elapsed=%.1fs status=0 (wallet pending)" % [TAG, elapsed])
+
+	var siws_status: int = plugin.call("getSiwsStatus")
+	print("%s _authorize_siws | FINAL_STATUS=%d elapsed=%.1fs" % [TAG, siws_status, elapsed])
+
+	if siws_status == 1:
+		# SIWS success — read all results from Kotlin plugin
+		var pubkey_str: String = plugin.call("getConnectedKeyBase58")
+		var siws_sig_bytes: PackedByteArray = plugin.call("getSiwsSignature")
+		var siws_sig_hex: String = siws_sig_bytes.hex_encode()
+		var siws_label: String = plugin.call("getSiwsAccountLabel")
+		var siws_chains: String = plugin.call("getSiwsAccountChains")
+		var siws_features: String = plugin.call("getSiwsAccountFeatures")
+
+		print("%s _authorize_siws | SIWS_RESULT pubkey=%s pubkey_len=%d siws_sig_hex=%s siws_sig_size=%d label=%s chains=%s features=%s" % [TAG, pubkey_str, pubkey_str.length(), siws_sig_hex.substr(0, 40), siws_sig_bytes.size(), siws_label, siws_chains, siws_features])
+
+		# Validate pubkey
+		if pubkey_str.is_empty() or pubkey_str.length() < 20:
+			print("%s _authorize_siws | REJECTED empty/short pubkey len=%d — SIWS returned invalid key" % [TAG, pubkey_str.length()])
+			_is_connected = false
+			connected_pubkey = ""
+			_key_available = false
+			status_updated.emit("SIWS failed — invalid pubkey")
+			authorization_failed.emit("SIWS returned empty pubkey")
+			return false
+
+		# Set all connected state
+		connected_pubkey = pubkey_str
+		connected_wallet_type = wallet_type_id
+		_is_connected = true
+		_connection_completed = true
+		_connection_succeeded = true
+		_key_available = true
+
+		print("%s _authorize_siws | CONNECTED pubkey=%s wallet_type=%d (%s) siws_sig=%s elapsed=%.1fs" % [TAG, connected_pubkey, connected_wallet_type, _wallet_type_name(connected_wallet_type), siws_sig_hex.substr(0, 20), elapsed])
+		AndroidToastHelper.show("Authorized (SIWS): %s" % _truncate_pubkey(connected_pubkey))
+
+		# Cache auth with wallet type
+		cache.set_auth(connected_pubkey, auth_token, wallet_uri_base, connected_wallet_type)
+		print("%s _authorize_siws | cached auth pubkey=%s auth_token_len=%d wallet_type=%d" % [TAG, connected_pubkey, auth_token.length(), connected_wallet_type])
+
+		status_updated.emit("Connected: " + _truncate_pubkey(connected_pubkey))
+		authorized.emit(connected_pubkey)
+		return true
+
+	elif siws_status == 0:
+		print("%s _authorize_siws | TIMEOUT elapsed=%.1fs — wallet never responded" % [TAG, elapsed])
+		_is_connected = false
+		_key_available = false
+		status_updated.emit("Authorization timed out")
+		authorization_failed.emit("Timeout — no response from wallet")
+		return false
+
+	else:
+		print("%s _authorize_siws | FAILED status=%d elapsed=%.1fs — wallet rejected or error" % [TAG, siws_status, elapsed])
+		_is_connected = false
+		_key_available = false
+		status_updated.emit("Authorization rejected by wallet")
+		authorization_failed.emit("User rejected or wallet error")
+		return false
+
+
 ## ─── SIGN MESSAGE ────────────────────────────────────────────────────────────
 
 func sign_message(message: String) -> String:
@@ -508,7 +611,7 @@ func sign_and_send_transactions(transactions: Array) -> Array:
 	print("%s sign_and_send_transactions | START tx_count=%d is_connected=%s" % [TAG, transactions.size(), str(_is_connected)])
 
 	if not _is_connected or wallet_adapter == null:
-		print("%s sign_and_send_transactions | FAIL not connected" % TAG)
+		print("%s sign_and_send_transactions | FAIL not connected is_connected=%s wallet_adapter=%s" % [TAG, str(_is_connected), str(wallet_adapter != null)])
 		status_updated.emit("Not connected")
 		return []
 
@@ -516,93 +619,55 @@ func sign_and_send_transactions(transactions: Array) -> Array:
 	print("%s sign_and_send_transactions | has_WalletAdapterAndroid=%s" % [TAG, str(has_plugin)])
 
 	if not has_plugin:
-		print("%s sign_and_send_transactions | FAIL plugin not available" % TAG)
+		print("%s sign_and_send_transactions | FAIL plugin not available — signAndSend requires Kotlin plugin" % TAG)
 		status_updated.emit("Sign & send not available — plugin missing")
 		return []
 
 	var plugin = Engine.get_singleton("WalletAdapterAndroid")
 	status_updated.emit("Signing and sending %d transaction(s)..." % transactions.size())
 
-	# RPC URL for sendTransaction
-	var rpc_url_map := {"devnet": "https://api.devnet.solana.com", "mainnet-beta": "https://api.mainnet-beta.solana.com", "testnet": "https://api.testnet.solana.com"}
-	var rpc_url: String = rpc_url_map.get(AppConfig.CLUSTER, "https://api.devnet.solana.com")
+	# MWA 2.0 signAndSendTransactions: wallet signs AND broadcasts.
+	# We get back raw signature bytes (64-byte ed25519), NOT signed tx bytes.
+	# No RPC send step needed — wallet already broadcast to the network.
 
 	var signatures: Array = []
 	for i in range(transactions.size()):
-		# Step 1: Sign via Kotlin plugin (MWA signTransactions — same approach as Unity SDK)
-		print("%s sign_and_send_transactions | tx %d/%d calling signAndSendTransaction (tx_bytes=%d)" % [TAG, i + 1, transactions.size(), transactions[i].size()])
-		status_updated.emit("Approve in wallet...")
-		plugin.call("signAndSendTransaction", transactions[i])
+		var tx_bytes: PackedByteArray = transactions[i]
+		print("%s sign_and_send_transactions | tx %d/%d ENTRY tx_bytes_size=%d tx_hex=%s" % [TAG, i + 1, transactions.size(), tx_bytes.size(), tx_bytes.hex_encode().substr(0, 80)])
 
-		# Poll for signed tx (Kotlin returns base64 signed tx, NOT a signature)
-		print("%s sign_and_send_transactions | POLLING tx %d for signed bytes (timeout=30s)" % [TAG, i + 1])
+		# Reset status before each tx (Kotlin plugin uses global state)
+		print("%s sign_and_send_transactions | tx %d calling plugin.signAndSendTransaction()" % [TAG, i + 1])
+		status_updated.emit("Approve tx %d/%d in wallet..." % [i + 1, transactions.size()])
+		plugin.call("signAndSendTransaction", tx_bytes)
+
+		# Poll for wallet result (wallet signs + broadcasts, returns signature)
+		print("%s sign_and_send_transactions | tx %d POLLING for wallet result (timeout=60s)" % [TAG, i + 1])
 		var elapsed := 0.0
-		while elapsed < 30.0:
-			await get_tree().create_timer(0.2).timeout
-			elapsed += 0.2
-			var poll_status = plugin.call("getSignAndSendStatus")
+		while elapsed < 60.0:
+			await get_tree().create_timer(0.3).timeout
+			elapsed += 0.3
+			var poll_status: int = plugin.call("getSignAndSendStatus")
 			if poll_status != 0:
-				print("%s sign_and_send_transactions | POLL_DONE tx %d status=%d elapsed=%.1fs" % [TAG, i + 1, poll_status, elapsed])
+				print("%s sign_and_send_transactions | tx %d POLL_DONE status=%d elapsed=%.1fs" % [TAG, i + 1, poll_status, elapsed])
 				break
 			if int(elapsed * 10) % 50 == 0 and elapsed > 0.5:
-				print("%s sign_and_send_transactions | POLL_TICK tx %d elapsed=%.1fs status=0 (waiting)" % [TAG, i + 1, elapsed])
+				print("%s sign_and_send_transactions | tx %d POLL_TICK elapsed=%.1fs status=0 (wallet pending)" % [TAG, i + 1, elapsed])
 
-		var status = plugin.call("getSignAndSendStatus")
-		var base64_tx = str(plugin.call("getSignAndSendResult"))
-		print("%s sign_and_send_transactions | tx %d SIGN_RESULT status=%d base64_len=%d" % [TAG, i + 1, status, base64_tx.length()])
+		var final_status: int = plugin.call("getSignAndSendStatus")
+		print("%s sign_and_send_transactions | tx %d FINAL_STATUS=%d elapsed=%.1fs" % [TAG, i + 1, final_status, elapsed])
 
-		if status != 1 or base64_tx.is_empty():
-			print("%s sign_and_send_transactions | tx %d SIGN_FAILED status=%d" % [TAG, i + 1, status])
-			continue
-
-		# Step 2: Submit signed tx to Solana RPC via HTTPRequest (same as Unity SDK does)
-		print("%s sign_and_send_transactions | tx %d submitting to RPC %s" % [TAG, i + 1, rpc_url])
-		status_updated.emit("Sending to network...")
-
-		var http = HTTPRequest.new()
-		add_child(http)
-		var json_body := JSON.stringify({
-			"jsonrpc": "2.0",
-			"id": 1,
-			"method": "sendTransaction",
-			"params": [base64_tx, {"encoding": "base64", "skipPreflight": true, "preflightCommitment": "confirmed"}]
-		})
-		var headers := ["Content-Type: application/json"]
-		var err = http.request(rpc_url, headers, HTTPClient.METHOD_POST, json_body)
-		print("%s sign_and_send_transactions | tx %d HTTP request sent err=%d" % [TAG, i + 1, err])
-
-		if err != OK:
-			print("%s sign_and_send_transactions | tx %d HTTP_REQUEST_FAIL err=%d" % [TAG, i + 1, err])
-			http.queue_free()
-			continue
-
-		var response = await http.request_completed
-		http.queue_free()
-		var result_code: int = response[0]
-		var http_code: int = response[1]
-		var resp_headers = response[2]
-		var body: PackedByteArray = response[3]
-		var body_str := body.get_string_from_utf8()
-		print("%s sign_and_send_transactions | tx %d RPC response result=%d http=%d body_len=%d body=%s" % [TAG, i + 1, result_code, http_code, body_str.length(), body_str.substr(0, 200)])
-
-		# Parse response for tx signature
-		var json = JSON.new()
-		var parse_err = json.parse(body_str)
-		if parse_err == OK and json.data is Dictionary:
-			var rpc_result = json.data
-			if rpc_result.has("result") and rpc_result["result"] is String:
-				var tx_sig: String = rpc_result["result"]
-				signatures.append(tx_sig)
-				print("%s sign_and_send_transactions | tx %d SUCCESS tx_sig=%s sig_len=%d" % [TAG, i + 1, tx_sig, tx_sig.length()])
-			elif rpc_result.has("error"):
-				var rpc_err = rpc_result["error"]
-				print("%s sign_and_send_transactions | tx %d RPC_ERROR=%s" % [TAG, i + 1, str(rpc_err).substr(0, 200)])
-			else:
-				print("%s sign_and_send_transactions | tx %d UNEXPECTED response=%s" % [TAG, i + 1, body_str.substr(0, 200)])
+		if final_status == 1:
+			# Wallet signed + broadcast successfully — get the signature bytes
+			var sig_bytes: PackedByteArray = plugin.call("getSignAndSendResult")
+			var sig_hex: String = sig_bytes.hex_encode()
+			print("%s sign_and_send_transactions | tx %d SUCCESS sig_bytes_size=%d sig_hex=%s" % [TAG, i + 1, sig_bytes.size(), sig_hex])
+			signatures.append(sig_hex)
+		elif final_status == 0:
+			print("%s sign_and_send_transactions | tx %d TIMEOUT elapsed=%.1fs — wallet never responded" % [TAG, i + 1, elapsed])
 		else:
-			print("%s sign_and_send_transactions | tx %d JSON_PARSE_FAIL err=%d body=%s" % [TAG, i + 1, parse_err, body_str.substr(0, 100)])
+			print("%s sign_and_send_transactions | tx %d FAILED status=%d — wallet rejected or error" % [TAG, i + 1, final_status])
 
-	print("%s sign_and_send_transactions | DONE sent=%d/%d" % [TAG, signatures.size(), transactions.size()])
+	print("%s sign_and_send_transactions | DONE sent=%d/%d signatures=%s" % [TAG, signatures.size(), transactions.size(), str(signatures).substr(0, 200)])
 	if signatures.size() > 0:
 		AndroidToastHelper.show("Sent %d transaction(s)" % signatures.size(), true)
 		status_updated.emit("Sent! Sig: %s..." % str(signatures[0]).substr(0, 20))
