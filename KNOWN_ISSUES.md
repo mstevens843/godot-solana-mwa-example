@@ -239,3 +239,75 @@ ERROR: Error loading GDExtension configuration file: 'res://addons/WalletAdapter
 ```
 
 This appears on every launch. The WalletAdapterAndroid is loaded as an AAR via the Gradle build system, not as a GDExtension. Godot scans for `.gdextension` files and logs an error when it can't find one. Non-fatal — the plugin works correctly via the AAR path.
+
+---
+
+## Failed Fix Attempts — 2026-04-15 Session
+
+### Attempt 1: sign_and_send — Add clearState() + STEP logging to mwa_manager.gd
+
+**What was tried:** Added `plugin.call("clearState")` before `signAndSendTransaction()` to reset stale `myMessageSigningStatus`. Added STEP_1-8 numbered logs. Changed sign_and_send from the old "sign via wallet + RPC send" to direct MWA 2.0 approach (no RPC resubmission).
+
+**What actually happened:** The code was reverted by the user before testing because other changes broke things first.
+
+**Why it failed:** Got bundled with other changes that broke the app. Never tested in isolation.
+
+### Attempt 2: sign_and_send — Set tx.url_override to mainnet RPC
+
+**What was tried:** Added `tx.url_override = AppConfig.get_rpc_url()` to fix devnet blockhash issue. Solflare was showing "Network mismatch — transaction is for devnet." Phantom was silently rejecting (CancellationException). All wallets were failing because `Transaction.new()` defaults to devnet RPC.
+
+**What actually happened:** This fix was correct and verified working — Jupiter successfully signed and sent (status=1, got 64-byte signature). But the old GDScript code then tried to re-submit the already-broadcast transaction via RPC `sendTransaction`, passing `str(PackedByteArray)` as "base64" — RPC rejected with `"invalid base64 encoding: InvalidByte(0, 91)"`.
+
+**Root cause confirmed:** Transaction objects default to devnet RPC when `url_override` is not set. This fix (setting url_override) is correct and should be re-applied.
+
+### Attempt 3: sign_and_send — Remove RPC re-submission from mwa_manager.gd
+
+**What was tried:** Rewrote `sign_and_send_transactions()` to remove the HTTP `sendTransaction` RPC call. MWA 2.0 `signAndSendTransactions` has the wallet broadcast — no need to re-submit. Just extract the 64-byte signature and return it.
+
+**What actually happened:** Jupiter test succeeded with this change (got signature `36e69c56...`). Backpack crashed ("Backpack has stopped") — caused by 0-lamport transfer, not by this change.
+
+**Why it failed:** Got reverted along with everything else. The fix itself was correct.
+
+### Attempt 4: sign_and_send — Change 0-lamport to 100-lamport transfer
+
+**What was tried:** Changed `SystemProgram.transfer(payer, payer, 0)` to `SystemProgram.transfer(payer, payer, 100)` in `_on_sign_and_send()`. 0-lamport transfers crash Backpack ("Cannot read property 'err' of undefined").
+
+**What actually happened:** Never tested — got reverted with everything else.
+
+### Attempt 5: SIWS authorize — Replace connect_wallet() with connectWalletSiws()
+
+**What was tried:** Changed `authorize()` in mwa_manager.gd to call the Kotlin plugin's `connectWalletSiws()` instead of the C++ WalletAdapter's `connect_wallet()`. SIWS combines authorize + sign-in into one MWA session.
+
+**What actually happened:** SIWS worked intermittently. Phantom succeeded on second attempt (first failed with CancellationException — activity destroyed). Backpack and Jupiter SIWS worked. But it was unreliable — sometimes the `ComposeWalletActivity` is destroyed by Android before the wallet returns the result.
+
+**Root cause (from Phantom state logs):** Phantom processes BOTH MWA requests correctly (`authorize` then `signMessages`). User approves both. But the response for `signMessages` is lost because the local MWA WebSocket server dies when Android destroys `ComposeWalletActivity`. The `authorize` response arrives in ~2s (before destruction). The `signMessages` response arrives in ~4-5s (after destruction). Race condition.
+
+### Attempt 6: SIWS — Convert connectWalletSiws from @Composable to standalone CoroutineScope
+
+**What was tried:** Changed `connectWalletSiws` from a `@Composable` function with `LaunchedEffect` to a `suspend` function launched in `CoroutineScope(Dispatchers.Main + SupervisorJob())`. Same pattern as `signAndSendTransactionAsync` which works reliably.
+
+**What actually happened:** Made SIWS WORSE. Changed the error from intermittent `CancellationException` (sometimes works) to consistent `TimeoutException` (never works). The standalone scope keeps the coroutine alive, but the `ActivityResultSender` dies with the activity. The MWA WebSocket server can't deliver responses without a live sender. `signAndSendTransaction` works with standalone scope because it completes in ~8s (cached auth, no user interaction). SIWS takes 10-30s (two user prompts).
+
+**Why it failed:** The `ActivityResultSender` is tied to the activity lifecycle. Keeping the coroutine alive is useless if the sender is dead. The LaunchedEffect version at least sometimes works because the Compose lifecycle keeps the sender alive slightly longer.
+
+### Attempt 7: SIWS — Add auto-retry in GDScript authorize()
+
+**What was tried:** Wrapped the SIWS call + polling in a retry loop (max 2 attempts). Theory: first attempt warms up the wallet, second attempt succeeds because wallet responds faster.
+
+**What actually happened:** Never tested — got reverted with everything else. The auto-retry wouldn't have helped anyway because the WebSocket death happens on every attempt regardless.
+
+---
+
+## Key Findings from 2026-04-15 Session
+
+1. **Transaction url_override is required.** `Transaction.new()` defaults to devnet RPC. Must set `tx.url_override` to mainnet. This fix is confirmed correct.
+
+2. **sign_and_send should NOT re-submit via RPC.** MWA 2.0 `signAndSendTransactions` has the wallet broadcast. The GDScript side should just extract the signature. The old code's `str(PackedByteArray)` → `sendTransaction` approach is broken (invalid base64).
+
+3. **0-lamport transfers crash Backpack.** Use non-zero amount (100 lamports) for sign_and_send.
+
+4. **SIWS WebSocket dies with ComposeWalletActivity.** The MWA clientlib's `LocalAssociationScenario` starts a local WebSocket server that is activity-bound. When Android destroys the activity (~4s after wallet opens), the WebSocket dies. The `authorize` response arrives before destruction (~2s), but `signMessages` response arrives after (~4-5s). This is why SIWS works intermittently — it's a race condition.
+
+5. **Standalone CoroutineScope does NOT fix SIWS.** The coroutine survives but the `ActivityResultSender` and WebSocket are dead. Makes things worse (TimeoutException vs intermittent CancellationException).
+
+6. **signAndSendTransaction works with standalone scope** because it uses cached auth token and completes in ~8s without user interaction. SIWS requires two user prompts and takes too long.

@@ -78,7 +78,8 @@ func _on_sign_transaction() -> void:
 	add_child(tx)
 	tx.set_payer(payer)
 	tx.add_instruction(ix)
-	print("%s _on_sign_transaction | transaction built, payer set, instruction added" % TAG)
+	tx.url_override = AppConfig.get_rpc_url()
+	print("%s _on_sign_transaction | transaction built, payer set, instruction added, url_override=%s" % [TAG, tx.url_override])
 
 	# Fetch recent blockhash from RPC
 	print("%s _on_sign_transaction | fetching blockhash via tx.update_latest_blockhash()" % TAG)
@@ -136,7 +137,8 @@ func _on_sign_and_send() -> void:
 	add_child(tx)
 	tx.set_payer(payer)
 	tx.add_instruction(ix)
-	print("%s _on_sign_and_send | transaction built, payer set, instruction added" % TAG)
+	tx.url_override = AppConfig.get_rpc_url()
+	print("%s _on_sign_and_send | transaction built, payer set, instruction added, url_override=%s" % [TAG, tx.url_override])
 
 	# Fetch recent blockhash from RPC
 	print("%s _on_sign_and_send | fetching blockhash via tx.update_latest_blockhash()" % TAG)
@@ -145,9 +147,13 @@ func _on_sign_and_send() -> void:
 	var bh_result: Dictionary = await tx.blockhash_updated
 	print("%s _on_sign_and_send | blockhash_updated signal received result_keys=%s has_result=%s" % [TAG, str(bh_result.keys()), str(bh_result.has("result"))])
 	if bh_result.has("result"):
-		print("%s _on_sign_and_send | blockhash=%s" % [TAG, str(bh_result["result"]).substr(0, 80)])
+		var result_data = bh_result["result"]
+		print("%s _on_sign_and_send | blockhash_result=%s" % [TAG, str(result_data).substr(0, 200)])
+		if result_data is Dictionary and result_data.has("value") and result_data["value"] is Dictionary:
+			var bh_val = result_data["value"]
+			print("%s _on_sign_and_send | BLOCKHASH=%s lastValidBlockHeight=%s" % [TAG, str(bh_val.get("blockhash", "MISSING")), str(bh_val.get("lastValidBlockHeight", "MISSING"))])
 	else:
-		print("%s _on_sign_and_send | blockhash_error=%s" % [TAG, str(bh_result).substr(0, 120)])
+		print("%s _on_sign_and_send | blockhash_error=%s" % [TAG, str(bh_result).substr(0, 200)])
 
 	if not bh_result.has("result"):
 		print("%s _on_sign_and_send | FAIL no blockhash in result — cannot build valid transaction" % TAG)
@@ -158,7 +164,9 @@ func _on_sign_and_send() -> void:
 
 	# Serialize, sign via MWA, then submit to network
 	var tx_bytes := tx.serialize()
-	print("%s _on_sign_and_send | serialized tx_bytes_size=%d tx_bytes_hex=%s" % [TAG, tx_bytes.size(), tx_bytes.hex_encode().substr(0, 40)])
+	print("%s _on_sign_and_send | serialized tx_bytes_size=%d tx_bytes_hex=%s" % [TAG, tx_bytes.size(), tx_bytes.hex_encode().substr(0, 80)])
+	if tx_bytes.size() < 100 or tx_bytes.size() > 1500:
+		print("%s _on_sign_and_send | WARNING unusual tx_bytes_size=%d (expected 100-1500)" % [TAG, tx_bytes.size()])
 	status_label.text = "Approve in wallet..."
 
 	print("%s _on_sign_and_send | calling MWAManager.sign_and_send_transactions() with 1 tx" % TAG)
