@@ -226,85 +226,59 @@ func authorize(wallet_type_id: int = -1) -> bool:
 		print("%s authorize | re-applied wallet_type=%d after recreation" % [TAG, wallet_type_id])
 	print("%s authorize | adapter recreated — fresh session" % TAG)
 
-	# ─── SIWS AUTHORIZE (MWA 2.0) ───
-	# Uses Kotlin plugin's connectWalletSiws() directly — combines authorize + sign-in
-	# into a single MWA session. No double wallet picker, no separate sign_message step.
+	# ─── STANDARD AUTHORIZE (connectWallet) ───
+	# Uses C++ WalletAdapter's connect_wallet() which opens the OS wallet picker.
 
-	var has_plugin: bool = Engine.has_singleton("WalletAdapterAndroid")
-	if not has_plugin:
-		print("%s authorize | FAIL WalletAdapterAndroid plugin not available — cannot SIWS" % TAG)
-		_waiting_for_connection = false
-		authorization_failed.emit("Wallet plugin not available")
-		return false
+	# STEP_1: Reset stale Kotlin state
+	if Engine.has_singleton("WalletAdapterAndroid"):
+		var plugin = Engine.get_singleton("WalletAdapterAndroid")
+		plugin.call("clearState")
+		print("%s authorize | STEP_1 clearState() DONE" % TAG)
 
-	var plugin = Engine.get_singleton("WalletAdapterAndroid")
+	# STEP_2: Call connect_wallet via C++ WalletAdapter
+	print("%s authorize | STEP_2 calling connect_wallet() — OS picker should open" % TAG)
+	status_updated.emit("Choose your wallet...")
+	_connection_completed = false
+	_connection_succeeded = false
+	wallet_adapter.connect_wallet()
+	print("%s authorize | STEP_3 connect_wallet() CALLED — waiting for signal" % TAG)
 
-	# SIWS_STEP_1: Reset stale Kotlin state
-	print("%s authorize | SIWS_STEP_1 calling clearState() to reset stale signing/SIWS status" % TAG)
-	plugin.call("clearState")
-	print("%s authorize | SIWS_STEP_1 clearState() DONE" % TAG)
-
-	# SIWS_STEP_2: Call connectWalletSiws on the Kotlin plugin
-	var cluster_map := {"devnet": 0, "mainnet-beta": 1, "testnet": 2}
-	var cluster_val: int = cluster_map.get(AppConfig.CLUSTER, 0)
-	print("%s authorize | SIWS_STEP_2 calling connectWalletSiws cluster=%d domain=%s statement='%s'" % [TAG, cluster_val, AppConfig.SIWS_DOMAIN, AppConfig.SIWS_STATEMENT])
-	status_updated.emit("Sign in with your wallet...")
-	plugin.call("connectWalletSiws", cluster_val, AppConfig.APP_URI, AppConfig.APP_ICON_PATH, AppConfig.APP_NAME, AppConfig.SIWS_DOMAIN, AppConfig.SIWS_STATEMENT)
-	print("%s authorize | SIWS_STEP_3 connectWalletSiws() CALLED — wallet activity should launch" % TAG)
-
-	# SIWS_STEP_4: Poll getSiwsStatus() for wallet result
-	print("%s authorize | SIWS_STEP_4 POLLING start (timeout=60s, interval=0.3s)" % TAG)
+	# STEP_4: Poll for connection result (signal sets _connection_completed)
+	print("%s authorize | STEP_4 POLLING start (timeout=60s, interval=0.3s)" % TAG)
 	var elapsed := 0.0
 	var poll_count := 0
 	while elapsed < 60.0:
 		await get_tree().create_timer(0.3).timeout
 		elapsed += 0.3
 		poll_count += 1
-		var siws_status: int = plugin.call("getSiwsStatus")
-		if siws_status != 0:
-			print("%s authorize | SIWS_STEP_4 POLL_EXIT status=%d elapsed=%.1fs polls=%d" % [TAG, siws_status, elapsed, poll_count])
+		if _connection_completed:
+			print("%s authorize | STEP_4 POLL_EXIT _connection_completed=true elapsed=%.1fs polls=%d" % [TAG, elapsed, poll_count])
 			break
-		# Log every iteration for first 10s, then every 5s
 		if elapsed < 10.0 or (int(elapsed * 10) % 50 == 0 and elapsed > 0.5):
-			print("%s authorize | SIWS_POLL elapsed=%.1fs status=%d polls=%d" % [TAG, elapsed, siws_status, poll_count])
+			print("%s authorize | POLL elapsed=%.1fs completed=%s succeeded=%s polls=%d" % [TAG, elapsed, str(_connection_completed), str(_connection_succeeded), poll_count])
 
 	_waiting_for_connection = false
-	var final_siws_status: int = plugin.call("getSiwsStatus")
-	print("%s authorize | SIWS_STEP_5 FINAL_STATUS=%d elapsed=%.1fs total_polls=%d" % [TAG, final_siws_status, elapsed, poll_count])
+	print("%s authorize | STEP_5 FINAL completed=%s succeeded=%s elapsed=%.1fs total_polls=%d" % [TAG, str(_connection_completed), str(_connection_succeeded), elapsed, poll_count])
 
-	if final_siws_status == 1:
-		# SIWS_STEP_6: Success — extract pubkey and SIWS data
+	if _connection_completed and _connection_succeeded:
+		# STEP_6: Success — extract pubkey
 		_key_available = true
-		_connection_succeeded = true
-		_connection_completed = true
-
-		# SIWS sets myConnectedKey in Kotlin, so get_connected_key() returns the authorized pubkey
 		var raw_key = wallet_adapter.get_connected_key()
 		connected_pubkey = _extract_pubkey_string(raw_key)
-		print("%s authorize | SIWS_STEP_6 pubkey_from_adapter='%s' (len=%d)" % [TAG, connected_pubkey, connected_pubkey.length()])
-
-		# Fallback: if WalletAdapter returned empty, try SIWS pubkey bytes directly
-		if connected_pubkey.is_empty() or connected_pubkey.length() < 20:
-			print("%s authorize | SIWS_STEP_6 adapter pubkey empty — trying getSiwsPublicKey() bytes" % TAG)
-			var siws_pk_bytes: PackedByteArray = plugin.call("getSiwsPublicKey")
-			print("%s authorize | SIWS_STEP_6 getSiwsPublicKey size=%d hex=%s" % [TAG, siws_pk_bytes.size(), siws_pk_bytes.hex_encode()])
-			if siws_pk_bytes.size() == 32:
-				var pk_obj = Pubkey.new_from_bytes(siws_pk_bytes)
-				connected_pubkey = _extract_pubkey_string(pk_obj)
-				print("%s authorize | SIWS_STEP_6 pubkey_from_siws_bytes='%s'" % [TAG, connected_pubkey])
+		print("%s authorize | STEP_6 pubkey='%s' (len=%d)" % [TAG, connected_pubkey, connected_pubkey.length()])
 
 		# REJECT empty pubkey
 		if connected_pubkey.is_empty() or connected_pubkey.length() < 20:
-			print("%s authorize | SIWS_STEP_6 REJECTED empty pubkey (len=%d)" % [TAG, connected_pubkey.length()])
+			print("%s authorize | STEP_6 REJECTED empty pubkey (len=%d)" % [TAG, connected_pubkey.length()])
 			_is_connected = false
 			connected_pubkey = ""
 			_key_available = false
-			authorization_failed.emit("Empty pubkey from SIWS — please try again")
+			authorization_failed.emit("Empty pubkey — please try again")
 			return false
 
 		# REJECT deleted keys
 		if connected_pubkey in _deleted_keys:
-			print("%s authorize | SIWS_STEP_6 REJECTED deleted key=%s" % [TAG, connected_pubkey])
+			print("%s authorize | STEP_6 REJECTED deleted key=%s" % [TAG, connected_pubkey])
 			_is_connected = false
 			connected_pubkey = ""
 			_key_available = false
@@ -314,38 +288,33 @@ func authorize(wallet_type_id: int = -1) -> bool:
 
 		_is_connected = true
 		connected_wallet_type = wallet_adapter.wallet_type if "wallet_type" in wallet_adapter else -1
+		print("%s authorize | STEP_6 SUCCESS pubkey=%s wallet_type=%d (%s)" % [TAG, connected_pubkey, connected_wallet_type, _wallet_type_name(connected_wallet_type)])
 
-		# Extract SIWS signature and signed message
-		var sig_bytes: PackedByteArray = plugin.call("getSiwsSignature")
-		siws_signature = sig_bytes.hex_encode()
-		var msg_bytes: PackedByteArray = plugin.call("getSiwsSignedMessage")
-		siws_signed_message = msg_bytes.hex_encode()
-		siws_account_label = plugin.call("getSiwsAccountLabel")
+		AndroidToastHelper.show("Connected: %s" % _truncate_pubkey(connected_pubkey))
 
-		print("%s authorize | SIWS_STEP_6 SUCCESS pubkey=%s wallet_type=%d (%s)" % [TAG, connected_pubkey, connected_wallet_type, _wallet_type_name(connected_wallet_type)])
-		print("%s authorize | SIWS_STEP_6 siws_sig_size=%d siws_sig=%s" % [TAG, sig_bytes.size(), siws_signature.substr(0, 40)])
-		print("%s authorize | SIWS_STEP_6 siws_msg_size=%d account_label='%s'" % [TAG, msg_bytes.size(), siws_account_label])
-
-		AndroidToastHelper.show("Signed in: %s" % _truncate_pubkey(connected_pubkey))
-
-		# No separate sign-in step needed — SIWS handled auth + sign-in in one MWA session
-
-		# SIWS_STEP_7: Cache auth and emit signal
+		# STEP_7: Sync auth token from Kotlin plugin and cache to disk
+		if Engine.has_singleton("WalletAdapterAndroid"):
+			var kt_token := str(Engine.get_singleton("WalletAdapterAndroid").call("getAuthToken"))
+			if not kt_token.is_empty():
+				auth_token = kt_token
+				print("%s authorize | STEP_7 AUTH_CACHE synced authToken from Kotlin plugin token_len=%d" % [TAG, kt_token.length()])
+			else:
+				print("%s authorize | STEP_7 AUTH_CACHE Kotlin getAuthToken returned empty, using local auth_token_len=%d" % [TAG, auth_token.length()])
 		cache.set_auth(connected_pubkey, auth_token, wallet_uri_base, connected_wallet_type)
-		print("%s authorize | SIWS_STEP_7 cached auth pubkey=%s wallet_type=%d" % [TAG, connected_pubkey, connected_wallet_type])
+		print("%s authorize | STEP_7 AUTH_CACHE SAVED pubkey=%s token_len=%d wallet_type=%d" % [TAG, connected_pubkey, auth_token.length(), connected_wallet_type])
 
 		status_updated.emit("Connected: " + _truncate_pubkey(connected_pubkey))
 		authorized.emit(connected_pubkey)
-		print("%s authorize | SIWS_STEP_7 DONE — authorized signal emitted" % TAG)
+		print("%s authorize | STEP_7 DONE — authorized signal emitted" % TAG)
 		return true
 
-	elif final_siws_status == 2:
-		print("%s authorize | SIWS REJECTED by wallet elapsed=%.1fs" % [TAG, elapsed])
+	elif _connection_completed and not _connection_succeeded:
+		print("%s authorize | REJECTED by wallet elapsed=%.1fs" % [TAG, elapsed])
 		status_updated.emit("Authorization rejected by wallet")
 		authorization_failed.emit("User rejected or wallet error")
 		return false
 	else:
-		print("%s authorize | SIWS TIMEOUT elapsed=%.1fs — wallet never responded" % [TAG, elapsed])
+		print("%s authorize | TIMEOUT elapsed=%.1fs — wallet never responded" % [TAG, elapsed])
 		status_updated.emit("Authorization timed out")
 		authorization_failed.emit("Timeout — no response from wallet")
 		return false
@@ -361,7 +330,8 @@ func reauthorize() -> bool:
 		status_updated.emit("No cached authorization found")
 		return false
 
-	print("%s reauthorize | cached_pubkey=%s cached_token_len=%d" % [TAG, str(cached.get("pubkey", "")), str(cached.get("auth_token", "")).length()])
+	var cached_token := str(cached.get("auth_token", ""))
+	print("%s reauthorize | cached_pubkey=%s cached_token_len=%d" % [TAG, str(cached.get("pubkey", "")), cached_token.length()])
 	status_updated.emit("Reauthorizing with cached token...")
 
 	# Use our AuthCache directly — no connect_wallet() call needed.
@@ -375,14 +345,24 @@ func reauthorize() -> bool:
 		authorization_failed.emit("Cached pubkey is empty")
 		return false
 
+	# Push cached auth token back into the Kotlin plugin so MWA operations
+	# (sign, getCapabilities, etc.) use it without re-prompting the user.
+	if not cached_token.is_empty() and Engine.has_singleton("WalletAdapterAndroid"):
+		var plugin = Engine.get_singleton("WalletAdapterAndroid")
+		plugin.call("setAuthToken", cached_token)
+		print("%s reauthorize | CACHE_RESTORE pushed cached authToken to Kotlin plugin token_len=%d" % [TAG, cached_token.length()])
+	else:
+		print("%s reauthorize | CACHE_RESTORE SKIP — no cached token or no plugin (token_len=%d has_plugin=%s)" % [TAG, cached_token.length(), str(Engine.has_singleton("WalletAdapterAndroid"))])
+
 	connected_pubkey = pubkey
 	connected_wallet_type = wt
+	auth_token = cached_token
 	_is_connected = true
 	_connection_completed = true
 	_connection_succeeded = true
 	_key_available = true
 
-	print("%s reauthorize | CACHE_RECONNECT SUCCESS pubkey=%s wallet_type=%d" % [TAG, connected_pubkey, connected_wallet_type])
+	print("%s reauthorize | CACHE_RECONNECT SUCCESS pubkey=%s wallet_type=%d auth_token_len=%d" % [TAG, connected_pubkey, connected_wallet_type, auth_token.length()])
 	AndroidToastHelper.show("Reconnected: %s" % _truncate_pubkey(connected_pubkey))
 	status_updated.emit("Connected: " + _truncate_pubkey(connected_pubkey))
 	authorized.emit(connected_pubkey)
@@ -401,6 +381,17 @@ func deauthorize() -> void:
 		wallet_adapter.deauthorize()
 	else:
 		print("%s deauthorize | SDK deauthorize not available, clearing local state" % TAG)
+
+	# Clear Kotlin-side auth token and force fresh wallet picker on next connect
+	if Engine.has_singleton("WalletAdapterAndroid"):
+		var plugin = Engine.get_singleton("WalletAdapterAndroid")
+		plugin.call("setAuthToken", "")
+		plugin.call("clearStateFullReset")
+		print("%s deauthorize | AUTH_CACHE cleared Kotlin authToken + called clearStateFullReset" % TAG)
+
+	# Clear cached auth from disk
+	cache.clear_auth(connected_pubkey)
+	print("%s deauthorize | AUTH_CACHE cleared disk cache for pubkey=%s" % [TAG, connected_pubkey])
 
 	var old_pubkey := connected_pubkey
 	connected_pubkey = ""
