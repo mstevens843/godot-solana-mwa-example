@@ -11,6 +11,21 @@ const USE_OS_PICKER := true  # true = OS wallet picker, false = in-app wallet bu
 const SIWS_DOMAIN := "example.com"
 const SIWS_STATEMENT := "Sign in to MWA Example App"
 
+## Feature flags — flip these to toggle MWA behaviors
+
+## If true, use SIWS (Sign In With Solana) for connect + prove ownership in one prompt.
+## If false, use standard connectWallet (MWA 1.x authorize).
+## Seed Vault does not support SIWS and will fall back to standard automatically.
+const USE_SIWS := true
+
+## If true, use MWA native signAndSendTransactions (wallet signs AND broadcasts).
+## If false, use sign-only via MWA, then app sends via RPC.
+const USE_MWA_SIGN_AND_SEND := true
+
+## If true, persist auth tokens to disk via AuthCache (survives app restart).
+## If false, rely on Kotlin in-memory caching only (lost on app kill).
+const USE_AUTH_CACHE := true
+
 
 static func get_rpc_url() -> String:
 	match CLUSTER:
