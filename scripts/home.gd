@@ -173,10 +173,18 @@ func _on_sign_and_send() -> void:
 	var sigs := await MWAManager.sign_and_send_transactions([tx_bytes])
 	tx.queue_free()
 
-	print("%s _on_sign_and_send | RESULT sigs_count=%d sigs=%s" % [TAG, sigs.size(), str(sigs).substr(0, 80)])
+	print("%s _on_sign_and_send | RESULT sigs_count=%d sigs=%s last_error=%s" % [TAG, sigs.size(), str(sigs).substr(0, 80), MWAManager.last_error_code])
 	if sigs.is_empty():
 		print("%s _on_sign_and_send | FAIL no signatures returned from MWA" % TAG)
-		status_label.text = "Sign & send failed"
+		# Branch on MWAManager.last_error_code so the user gets a truthful
+		# message. INSUFFICIENT_FUNDS_FOR_RENT is by far the most common
+		# non-wallet failure (Seed Vault's wrapper injects priority fees
+		# that push low-balance fee-payers below the rent-exempt minimum).
+		# See KNOWN_ISSUES.md.
+		if MWAManager.last_error_code == "INSUFFICIENT_FUNDS_FOR_RENT":
+			status_label.text = "Fee-payer underfunded — send ≥0.001 SOL to %s and retry" % MWAManager.connected_pubkey.substr(0, 8)
+		else:
+			status_label.text = "Sign & send failed"
 	else:
 		print("%s _on_sign_and_send | SUCCESS first_sig=%s" % [TAG, str(sigs[0]).substr(0, 40)])
 		status_label.text = "Sent! Sig: " + str(sigs[0]).substr(0, 20) + "..."

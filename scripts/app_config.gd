@@ -16,7 +16,11 @@ const SIWS_STATEMENT := "Sign in to MWA Example App"
 ## If true, use SIWS (Sign In With Solana) for connect + prove ownership in one prompt.
 ## If false, use standard connectWallet (MWA 1.x authorize).
 ## Seed Vault does not support SIWS and will fall back to standard automatically.
-const USE_SIWS := true
+## Default is false so the demo matches the Unity + Cocos example apps — plain
+## authorize keeps the connect flow to a single wallet intent and avoids the
+## extra sign-in-message approval step that not every wallet supports cleanly.
+## Flip to true for a SIWS-enabled auth demo.
+const USE_SIWS := false
 
 ## If true, use MWA native signAndSendTransactions (wallet signs AND broadcasts).
 ## If false, use sign-only via MWA, then app sends via RPC.

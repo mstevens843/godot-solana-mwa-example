@@ -1,5 +1,132 @@
 # Known Issues — Godot Solana SDK MWA Integration
 
+> **If you're catching up on this app for the first time:** the first three sections below (Phantom `sign_messages`, Solflare `sign_messages`, Backpack `sign_and_send_transactions`) are *wallet*-side bugs/gaps that shaped how this example app routes each button. Each has a specific per-wallet workaround in `scripts/mwa_manager.gd`. Everything after is SDK-level (Godot Solana SDK) or dev-UX notes.
+
+---
+
+## High: Phantom Mobile Does Not Implement `sign_messages` Over MWA
+
+**Status:** Wallet-side gap — worked around in this example by routing Phantom's **Delete Account** flow through a throwaway `sign_transaction` (0-lamport self-transfer) instead of `sign_messages`. The signed tx is NEVER broadcast; the signature is proof of consent.
+**Severity:** Was High (delete hung indefinitely on Phantom before the fix).
+**Affects:** Phantom Mobile (`app.phantom`). Same gap exists in Cocos and Unity example apps.
+
+### What actually happens
+
+Connect Phantom via MWA, then call `signTextMessage` or `sign_messages`. Phantom opens, the user sees an approve screen — but the response never reaches the dApp. One of two failure modes:
+1. The request hangs for ~90 seconds, then the MWA client lib's internal timer fires a `TimeoutException` wrapped in `ExecutionException`.
+2. After ~5-10 seconds the WebSocket closes from Phantom's side with a null-cause `CancellationException` (no protocol-level reply).
+
+### Why (evidence)
+
+Phantom Mobile's `get_capabilities` response advertises only MWA 1.x sign-and-send support — it never declares sign_messages:
+
+```
+features=["supports_sign_and_send_transactions"]  max_txs=10  max_msgs=1  versions=["legacy","0"]
+```
+
+Per the MWA spec, `features[]` is the authoritative list of implemented methods. Phantom simply has no handler for `sign_messages` on Android MWA. `max_msgs=1` is an advisory per-batch ceiling, not a support flag — it means nothing by itself. Calling the unimplemented method reliably fails because the wallet doesn't know to send a protocol-level error; it just closes the socket or lets the internal timer expire.
+
+### Workaround in this example app
+
+`scripts/mwa_manager.gd` `delete_account()` detects Phantom (`connected_wallet_type == WALLET_PHANTOM = 20`) and routes through `_confirm_delete_via_throwaway_tx()`:
+
+1. Build a minimal `SystemProgram.transfer(payer, payer, 0)` — a 0-lamport self-transfer. Zero economic effect.
+2. `tx.update_latest_blockhash()` via the configured RPC.
+3. `tx.serialize()` → pass the bytes to `sign_transaction()` which calls MWA `sign_transactions` on Phantom (which it DOES implement).
+4. A non-empty returned signature = user approved = proceed with local cache clear.
+5. **The signed tx is NEVER broadcast.** The blockhash harmlessly expires. No lamports spent, no memo or transfer hits chain. The signature alone is proof of ownership.
+
+This same gate is ALSO used for Solflare (see next section). Other wallets (Backpack, Jupiter, Seed Vault) continue to use the `sign_message` path for delete confirmation.
+
+### Related Phantom-side issue: Blowfish transaction-warning modals
+
+Even when `sign_transactions` works, Phantom's on-device transaction simulator (Blowfish) evaluates the originating dApp and stacks "this app may be malicious" warning modals in front of the approve screen when the dApp is unverified. Triggers:
+- `APP_URI` is a placeholder (`https://example.com`).
+- `APP_NAME` contains "Example" / "Test" / "Demo".
+- `CLUSTER` is `mainnet-beta` (stricter threshold than devnet).
+- dApp not on Phantom's verified allowlist.
+
+**Mitigation:** Production dApps should register their domain with Phantom's dApp verification program and use a real identity in `scripts/app_config.gd`. The current Grant demo uses the `example.com` placeholder; production ports should replace it.
+
+---
+
+## High: Solflare Mobile Does Not Implement `sign_messages` Over MWA
+
+**Status:** Wallet-side gap — worked around in this example by routing Solflare's **Delete Account** flow through the same throwaway `sign_transaction` gate as Phantom. The older workaround (re-auth via `connect_wallet()`) is superseded.
+**Severity:** Was High (delete "crashed" on Solflare before).
+**Affects:** Solflare Mobile (`com.solflare.mobile`).
+
+### What actually happens
+
+Call `signTextMessage` on a Solflare MWA session. Solflare opens, shows an approve screen, then closes the WebSocket ~7 seconds later without a protocol-level result. Same `CancellationException msg=null` pattern previously attributed to a "Solflare crash" — the underlying cause is simpler: Solflare has no handler for this method.
+
+### Why (evidence)
+
+Solflare's `get_capabilities` response advertises `solana:signTransactions` but NOT `solana:signMessages`:
+
+```
+features=["solana:signTransactions"]  max_txs=20  max_msgs=20  versions=["legacy","0"]
+```
+
+Like Phantom, Solflare never declares sign_messages — no handler. `max_msgs=20` is advisory and meaningless for support. The wallet has no handler, so it closes the connection.
+
+### Workaround in this example app
+
+Same `_confirm_delete_via_throwaway_tx()` gate used for Phantom — see `scripts/mwa_manager.gd` `delete_account()`. Works cleanly; nothing broadcast. Historically Solflare used a re-authorization loop (`connect_wallet()` + polling connection result), which also worked but caused a second wallet picker flash. The throwaway-tx gate is the unified Phantom/Solflare path now.
+
+Note: Solflare does NOT run a Blowfish-style transaction simulator. You will not see "this app may be malicious" modals on Solflare for the same transactions Phantom warns about.
+
+---
+
+## High: Backpack Mobile `sign_and_send_transactions` Crashes
+
+**Status:** Wallet-side bug — worked around in this example by routing Backpack's **Sign & Send** button through Godot SDK's `Transaction.sign()` + `Transaction.send()` pattern (sign via MWA, broadcast via Solana JSON-RPC) instead of the native MWA `sign_and_send_transactions`. Same bug exists in Cocos and Unity example apps (both have matching workarounds).
+**Severity:** High (the Sign & Send button was unusable on Backpack).
+**Affects:** Backpack Mobile (`app.backpack`).
+
+### What actually happens
+
+Call MWA's native `sign_and_send_transactions` with Backpack connected. About 19 seconds pass with no wallet UI response, then the WebSocket closes from Backpack's side. The MWA client library surfaces this as a `CancellationException`. Backpack's own internal logs (not visible to dApps) show:
+
+```
+kotlinx.serialization.json.internal.JsonDecodingException:
+  Class discriminator was missing in SolanaMobileWalletAdapterWalletLibModule
+```
+
+Backpack's Kotlin plugin fails to deserialize the sign_and_send RPC request and silently crashes the handler. Their `sign_transactions` handler is NOT affected.
+
+### Workaround in this example app
+
+`scripts/mwa_manager.gd` `sign_and_send_transactions()` checks `connected_wallet_type`. If it's `WALLET_BACKPACK` (36), the code routes through `_sign_and_broadcast_via_rpc()`:
+
+1. Reconstruct each raw tx into a Godot `Transaction` node via `Transaction.new_from_bytes()`.
+2. `tx.set_signers([wallet_adapter])` so the WalletAdapter is the signer.
+3. `tx.sign()` + `await tx.fully_signed` — this triggers an MWA `sign_transactions` call to the wallet. Backpack's sign_transactions handler is correct; one wallet intent, one user approval.
+4. `tx.url_override = AppConfig.get_rpc_url()` then `tx.send()` — broadcasts the signed tx to the configured Solana RPC endpoint. This is Godot SDK's native RPC broadcast, same as used by the MplCore/honeycomb examples.
+5. `await tx.transaction_response_received` → collect the base58 signature from the RPC response.
+
+Same UX as the native path (one wallet approval), tx lands on chain, works every time. For every wallet OTHER than Backpack, the native MWA `signAndSendTransaction` path is retained — no behavior change for Phantom, Solflare, Jupiter, or Seed Vault.
+
+### Why split by wallet instead of always using sign+RPC?
+
+Seed Vault has a smoother native sign_and_send UX because it can submit the tx from inside the secure enclave without a separate RPC roundtrip. Keeping the native path for non-Backpack wallets preserves that UX.
+
+---
+
+## Connect defaults to plain `authorize` (NOT SIWS)
+
+**Status:** By design for this Grant demo (`AppConfig.USE_SIWS := false`).
+
+The Connect button calls `connect_wallet()` → Kotlin plugin `connectWallet()` → MWA 1.x `authorize`. SIWS (MWA 2.0 Sign-In-With-Solana, which bundles a signed sign-in message into the authorize response) is deliberately NOT the default here because:
+
+- Not every mobile wallet implements SIWS (Seed Vault, specifically).
+- SIWS adds a second wallet confirmation screen at connect time, increasing connect-flow friction for a dev/demo app.
+- The Grant scope didn't require the signed-in-message.
+
+Set `AppConfig.USE_SIWS := true` to opt into SIWS. `scripts/mwa_manager.gd` `authorize()` branches on this flag — see `_authorize_siws()` vs `_authorize_standard()`.
+
+---
+
 ## Critical: sign_text_message() Opens a New MWA Session (Double Wallet Picker)
 
 **Status:** SDK bug — needs fix in godot-solana-sdk Kotlin Android plugin
@@ -311,3 +438,91 @@ This appears on every launch. The WalletAdapterAndroid is loaded as an AAR via t
 5. **Standalone CoroutineScope does NOT fix SIWS.** The coroutine survives but the `ActivityResultSender` and WebSocket are dead. Makes things worse (TimeoutException vs intermittent CancellationException).
 
 6. **signAndSendTransaction works with standalone scope** because it uses cached auth token and completes in ~8s without user interaction. SIWS requires two user prompts and takes too long.
+
+---
+
+## High: `InsufficientFundsForRent` on Sign & Send — Underfunded Fee-Payer (Especially via Seed Vault)
+
+**Status:** Worked around at the SDK layer — `mwa_manager.gd` does a pre-broadcast balance check and maps RPC-side rent errors to `last_error_code = "INSUFFICIENT_FUNDS_FOR_RENT"` so `home.gd` can tell the user to fund the account. Not a code bug; a funding problem.
+**Severity:** Was Medium (user-confusing). The sign succeeded, the user saw the wallet approve, and then the transaction silently failed at RPC broadcast with a generic "Sign & send failed" message.
+**Affects:** Any fee-payer with a balance below `rent_exempt_min + tx_fee + priority_fee_buffer` (~0.001 SOL). Especially visible with **Seed Vault** (the Solana Seeker's default wallet) because its Solflare-built wrapper injects ComputeBudget priority-fee instructions before signing — this raises the required balance before the tx ever reaches the RPC. Also hits **Phantom on Solana Seeker** because Phantom uses the same Seed Vault secure element there.
+
+### What actually happens
+
+Tap Sign & Send with a fee-payer whose balance is just barely above Solana's rent-exempt minimum (890,880 lamports). The base tx fee (~5000 lamports) plus Seed Vault's injected priority fees drops the account below rent, and preflight rejects:
+
+```
+code=-32002 "Transaction simulation failed: Transaction results in an account (0) with insufficient funds for rent"
+err={"InsufficientFundsForRent":{"account_index":0}}
+```
+
+Signed-tx inflation is the fingerprint — unsigned memo tx is ~203 bytes, Seed Vault returns a signed tx of ~255 bytes (+52 bytes = one `SetComputeUnitLimit` + one `SetComputeUnitPrice` instruction plus the extra account for the `ComputeBudget111…` program).
+
+### Why (evidence-backed)
+
+- **Rent-exempt minimum for a zero-data System-owned account is 890,880 lamports** — ~0.00089 SOL. See [Solana accounts docs](https://solana.com/docs/core/accounts).
+- **Seed Vault is a signing-only secure element behind a Solflare wrapper** — [Seed Vault Wallet blog post](https://blog.solanamobile.com/post/seed-vault-wallet----solana-seekers-native-mobile-wallet) confirms this. Its MWA `get_capabilities` reply only lists `solana:signTransactions`.
+- **MWA 2.0 spec self-contradicts** on `solana:signAndSendTransaction` — "mandatory feature" but "implementation of this method by a wallet endpoint is optional." Seed Vault's capabilities reply is spec-compliant given that carve-out. See [MWA 2.0 spec](https://solana-mobile.github.io/mobile-wallet-adapter/spec/spec.html).
+- **`skipPreflight: true` does NOT help** — Solana validators recheck rent at execution. The tx lands on-chain, fails at execution, and the fee is burned.
+
+### Fix
+
+1. **Pre-broadcast balance check** — `mwa_manager.gd` `sign_and_send_transactions` fetches the fee-payer balance via raw `HTTPRequest`-based `getBalance` before any wallet intent is opened. If `lamports < 1_000_000` (covers 890_880 rent + ~5_000 fee + ~100_000 priority-fee buffer), short-circuit with `last_error_code = "INSUFFICIENT_FUNDS_FOR_RENT"` — no wallet approval screen appears.
+2. **RPC-side error detection** — `_sign_and_broadcast_via_rpc` (the Backpack sign+RPC fallback path) parses the `response["error"]` string for `InsufficientFundsForRent` and sets the same `last_error_code`. Handles the edge case where the balance was just above the threshold pre-check but the wallet's priority-fee injection pushed it over.
+3. **UI toast** — `home.gd` `_on_sign_and_send` branches on `MWAManager.last_error_code`. On `INSUFFICIENT_FUNDS_FOR_RENT` it shows "Fee-payer underfunded — send ≥0.001 SOL to {pubkey} and retry".
+
+### How to reproduce
+
+1. Connect Seed Vault (on Seeker) or Phantom (using the Seeker's Seed Vault keypair) with a fee-payer balance near the rent-exempt minimum (fund it with exactly 0.0009 SOL). Tap Sign & Send. Expected: immediate "Fee-payer underfunded" message, no wallet intent opens. Logcat: `STEP_PREFLIGHT_FAIL balance=890880 required=~1000000`.
+2. Send 0.01 SOL to the fee-payer from another wallet. Retry Sign & Send. Balance check passes, sign completes, tx lands on-chain.
+3. Regression check: Backpack / Solflare / Jupiter with funded accounts — Sign & Send works unchanged.
+
+### Files
+
+- `scripts/mwa_manager.gd` — added `last_error_code` public variable, pre-flight balance check in `sign_and_send_transactions`, rent-error parse in `_sign_and_broadcast_via_rpc`, `_fetch_balance_lamports` HTTPRequest helper.
+- `scripts/home.gd` — `_on_sign_and_send` branches on `last_error_code == "INSUFFICIENT_FUNDS_FOR_RENT"` to show the truthful message.
+
+---
+
+## Low: Jupiter Mobile `get_capabilities` Confirm Modal Renders Blank
+
+**Status:** Wallet-side bug — no dApp-side fix. Documented so contributors don't waste cycles on it.
+**Severity:** Cosmetic. The RPC response still makes it back to the app, so Get Capabilities returns the correct result. The modal UI just fails to render content.
+**Affects:** Jupiter Mobile wallet (`ag.jup.app`).
+
+### Symptom
+
+Connect Jupiter → tap Get Capabilities → Jupiter opens its own bottom-sheet confirm modal. The modal frame renders but the content never loads — no message, no Approve button, no Reject button. Tapping outside dismisses it, and the dApp still receives a correct capabilities response. Nothing actionable on our side.
+
+### Why (hypothesis)
+
+Jupiter's public mobile adapter [TeamRaccoons/jup-mobile-adapter](https://github.com/TeamRaccoons/jup-mobile-adapter) is a WalletConnect/Reown wrapper, not a native MWA protocol wallet. That architectural mismatch likely explains the modal content failing to render. Per MWA spec, `get_capabilities` is a pure query that should not require user interaction at all, but Jupiter shows a confirm modal anyway (and fails to populate it). Zero GitHub issues filed in `jup-ag/*` or `TeamRaccoons/*` mentioning this.
+
+### Fix
+
+None on our side. Workaround for users: tap outside the modal to dismiss it — the capabilities response still arrives.
+
+---
+
+## Pass 14: `USE_MWA_SIGN_AND_SEND=false` now actually broadcasts
+
+**Status:** Bug fix. The feature flag existed in `scripts/app_config.gd` before Pass 14, but flipping it off produced a sign-only path that printed *"RPC send not implemented (sign-only mode)"* and returned without broadcasting anything — the tx was signed but not on-chain.
+**Severity:** Flag was advertised as a routing switch but didn't send transactions in the OFF position.
+**Affects:** Anyone setting `USE_MWA_SIGN_AND_SEND=false`. Defaults (`true`) were never affected.
+
+### What changed
+
+`scripts/mwa_manager.gd` `sign_and_send_transactions()` now routes the `not AppConfig.USE_MWA_SIGN_AND_SEND` branch into the existing `_sign_and_broadcast_via_rpc()` helper (the same path Backpack uses unconditionally). One wallet prompt, tx signed via MWA `sign_transactions`, broadcast via `SolanaClient.send_transaction`. Toast and status updates now reflect a real on-chain signature.
+
+### Result
+
+Flag matrix now matches Cocos defaults and actually works:
+
+| `USE_MWA_SIGN_AND_SEND` | Non-Backpack wallets | Backpack |
+|---|---|---|
+| `true` (default) | Native MWA `sign_and_send_transactions` (wallet broadcasts) | Forced to `_sign_and_broadcast_via_rpc` — wallet's native handler crashes |
+| `false` | `_sign_and_broadcast_via_rpc` — sign via MWA, broadcast via RPC | Same (unchanged by flag) |
+
+### Cross-reference
+
+Cocos's per-wallet matrix (`../cocos-solana-mwa/WALLET_COMPATIBILITY.md`) documents exact wallet behaviour; Godot reaches the same matrix after this fix.

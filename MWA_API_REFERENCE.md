@@ -4,6 +4,19 @@
 
 ---
 
+## Cross-SDK parity notes
+
+### 2026-04-17 audit vs Unity PRs #274 + `feat/expose-mwa-auth-token`
+
+| Feature | Unity change | Godot status |
+|---|---|---|
+| `SignMessage(string)` convenience | Unity PR #274 adds string overload to `WalletBase.cs` + `IWalletBase.cs`. | **Already present under a different name.** Godot has `WalletAdapter::sign_text_message(const String &)` at `include/wallet_adapter/wallet_adapter.hpp:278`, bound to GDScript via `sign_text_message(text_message)`. Godot's `sign_message(PackedByteArray, index)` is a separate API for transaction-message signing and intentionally has no string overload. |
+| Public MWA `auth_token` | Unity `feat/expose-mwa-auth-token` adds `public string AuthToken` on `SolanaMobileWalletAdapter` + `SolanaWalletAdapter`. | **In flight — upstream PR [#454](https://github.com/Virus-Axel/godot-solana-sdk/pull/454).** Adds `getAuthToken()` / `setAuthToken()` to the Kotlin plugin. `grant-godot/scripts/mwa_manager.gd:243-250` already calls this via `Engine.get_singleton("WalletAdapterAndroid")`; the consumer is ready the moment #454 merges. Supersedes any earlier "auth_token NOT exposed" note in this doc. |
+
+No additional Godot SDK PRs opened as a result of this audit.
+
+---
+
 ## How MWA Sessions Work
 
 Every MWA interaction happens inside a **session**. In React Native and Kotlin, this is the `transact()` wrapper. The session:

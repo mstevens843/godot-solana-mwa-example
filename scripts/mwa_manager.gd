@@ -36,6 +36,12 @@ var siws_signed_message: String = ""
 var siws_account_label: String = ""
 var cache: AuthCache = AuthCache.new()
 
+## Last error code from the most recent MWA operation. Populated on failure paths
+## (cleared on successful call start). Lets UI branch on specific conditions —
+## e.g. `INSUFFICIENT_FUNDS_FOR_RENT` so we can show a "fund the account" toast
+## instead of a generic "send failed". See KNOWN_ISSUES.md.
+var last_error_code: String = ""
+
 var _is_connected: bool = false
 var _connection_completed: bool = false
 var _connection_succeeded: bool = false
@@ -622,35 +628,53 @@ func sign_transaction(serialized_tx: PackedByteArray) -> String:
 ## ─── SIGN AND SEND TRANSACTIONS ──────────────────────────────────────────────
 
 func sign_and_send_transactions(transactions: Array) -> Array:
-	print("%s sign_and_send_transactions | START tx_count=%d is_connected=%s USE_MWA_SIGN_AND_SEND=%s" % [TAG, transactions.size(), str(_is_connected), str(AppConfig.USE_MWA_SIGN_AND_SEND)])
+	print("%s sign_and_send_transactions | START tx_count=%d is_connected=%s USE_MWA_SIGN_AND_SEND=%s wallet_type=%d (%s)" % [TAG, transactions.size(), str(_is_connected), str(AppConfig.USE_MWA_SIGN_AND_SEND), connected_wallet_type, _wallet_type_name(connected_wallet_type)])
+	last_error_code = ""
 
 	if not _is_connected or wallet_adapter == null:
 		print("%s sign_and_send_transactions | FAIL not connected" % TAG)
+		last_error_code = "NOT_CONNECTED"
 		status_updated.emit("Not connected")
 		return []
 
-	# ─── FALLBACK PATH: sign via MWA, send via app-side RPC ───
-	if not AppConfig.USE_MWA_SIGN_AND_SEND:
-		print("%s sign_and_send_transactions | FALLBACK MODE — sign via MWA, send via RPC" % TAG)
-		var signatures: Array = []
-		for i in range(transactions.size()):
-			var tx_bytes: PackedByteArray = transactions[i]
-			print("%s sign_and_send_transactions | FALLBACK tx %d/%d signing via wallet_adapter" % [TAG, i + 1, transactions.size()])
-			status_updated.emit("Sign tx %d/%d in wallet..." % [i + 1, transactions.size()])
-			var sig := await sign_transaction(tx_bytes)
-			if sig.is_empty():
-				print("%s sign_and_send_transactions | FALLBACK tx %d SIGN_FAILED" % [TAG, i + 1])
-				continue
-			print("%s sign_and_send_transactions | FALLBACK tx %d SIGNED sig=%s — RPC send not implemented (sign-only mode)" % [TAG, i + 1, sig.substr(0, 20)])
-			signatures.append(sig)
-		print("%s sign_and_send_transactions | FALLBACK DONE signed=%d/%d" % [TAG, signatures.size(), transactions.size()])
-		if signatures.size() > 0:
-			AndroidToastHelper.show("Signed %d tx (RPC send not implemented in fallback)" % signatures.size())
-			status_updated.emit("Signed %d tx — use MWA sign+send for broadcast" % signatures.size())
+	# Pre-broadcast balance check — see KNOWN_ISSUES.md "Insufficient funds for rent".
+	# Solana's rent-exempt minimum is 890,880 lamports; add base tx fee + priority-
+	# fee buffer and we need ~0.001 SOL before we even open the wallet. Seed Vault's
+	# Solflare wrapper injects ComputeBudget priority-fee instructions before signing,
+	# so under-funded fee-payers get `-32002 InsufficientFundsForRent` at RPC preflight.
+	# Short-circuit here so the user gets a clear "fund the account" message instead
+	# of "signed but rejected".
+	if not connected_pubkey.is_empty():
+		var bal := await _fetch_balance_lamports(connected_pubkey)
+		const RENT_EXEMPT_BUFFER_LAMPORTS := 1_000_000
+		if bal < 0:
+			print("%s sign_and_send_transactions | STEP_PREFLIGHT_BALANCE_UNKNOWN — getBalance failed, proceeding anyway" % TAG)
+		elif bal < RENT_EXEMPT_BUFFER_LAMPORTS:
+			print("%s sign_and_send_transactions | STEP_PREFLIGHT_FAIL balance=%d required=~%d pubkey=%s" % [TAG, bal, RENT_EXEMPT_BUFFER_LAMPORTS, connected_pubkey])
+			last_error_code = "INSUFFICIENT_FUNDS_FOR_RENT"
+			status_updated.emit("Fee-payer underfunded — send ≥0.001 SOL and retry")
+			return []
 		else:
-			status_updated.emit("Signing failed")
-		transactions_sent.emit(signatures)
-		return signatures
+			print("%s sign_and_send_transactions | STEP_PREFLIGHT_BALANCE_OK balance=%d threshold=%d" % [TAG, bal, RENT_EXEMPT_BUFFER_LAMPORTS])
+
+	# ─── BACKPACK WORKAROUND: sign via WalletAdapter + broadcast via RPC ───
+	# Backpack's native MWA sign_and_send_transactions handler crashes with a
+	# Kotlin JsonDecodingException ("Class discriminator was missing...") and
+	# closes the WebSocket without a reply. Their sign_transactions handler
+	# works fine. Route Backpack through the Godot SDK's Transaction.sign() +
+	# Transaction.send() pattern — same split as the Unity/Cocos example apps.
+	# See KNOWN_ISSUES.md "Backpack sign_and_send crashes".
+	if connected_wallet_type == WALLET_BACKPACK:
+		return await _sign_and_broadcast_via_rpc(transactions)
+
+	# ─── FALLBACK PATH: sign via MWA, broadcast via app-side RPC ───
+	# Reuses the Backpack-workaround path (`_sign_and_broadcast_via_rpc`) for
+	# every wallet when `USE_MWA_SIGN_AND_SEND=false`. Same UX as the Cocos
+	# default `signAndSendTransaction()` — one wallet prompt, tx returns a real
+	# on-chain signature.
+	if not AppConfig.USE_MWA_SIGN_AND_SEND:
+		print("%s sign_and_send_transactions | FALLBACK MODE — sign via MWA, broadcast via RPC (app-side)" % TAG)
+		return await _sign_and_broadcast_via_rpc(transactions)
 
 	# ─── MWA 2.0 PATH: wallet signs AND broadcasts ───
 	var has_plugin: bool = Engine.has_singleton("WalletAdapterAndroid")
@@ -816,29 +840,26 @@ func delete_account() -> void:
 
 	# Require wallet confirmation before deleting.
 	# Route based on connected_wallet_type:
-	#   Solflare (25) → connect_wallet() only (signMessage broken on MWA for Solflare)
-	#   All others → sign_text_message() (biometric/sign confirmation)
+	#   Phantom (20) / Solflare (25) → throwaway sign_transaction of a 0-lamport
+	#       self-transfer. Neither wallet implements `sign_messages` over MWA
+	#       (their get_capabilities responses omit it — Phantom advertises only
+	#       "supports_sign_and_send_transactions", Solflare only "solana:signTransactions").
+	#       Both DO implement sign_transactions cleanly. The signed tx is NOT
+	#       broadcast — the signature itself is proof of consent. See KNOWN_ISSUES.md.
+	#   All other wallets → sign_text_message() (biometric/sign confirmation)
 	print("%s delete_account | connected_wallet_type=%d (%s)" % [TAG, connected_wallet_type, _wallet_type_name(connected_wallet_type)])
 
-	if connected_wallet_type == WALLET_SOLFLARE:
-		# Solflare: signMessage broken — use connect_wallet() like SolPulse's nativeAuthorize()
-		print("%s delete_account | Solflare — using connect_wallet() for confirmation" % TAG)
-		status_updated.emit("Approve in Solflare to confirm deletion...")
-		_connection_completed = false
-		_connection_succeeded = false
-		_key_available = false
-		wallet_adapter.connect_wallet()
-
-		var elapsed := 0.0
-		while not _connection_completed and elapsed < 30.0:
-			await get_tree().create_timer(0.5).timeout
-			elapsed += 0.5
-
-		if not (_connection_completed and _connection_succeeded):
-			print("%s delete_account | Solflare confirmation rejected — cancelling delete" % TAG)
-			status_updated.emit("Delete cancelled — wallet confirmation required")
+	if connected_wallet_type == WALLET_PHANTOM or connected_wallet_type == WALLET_SOLFLARE:
+		# Phantom/Solflare: no sign_messages support → gate on sign_transaction
+		var wallet_name := _wallet_type_name(connected_wallet_type)
+		print("%s delete_account | %s — using throwaway sign_transaction for confirmation (sign_messages not supported by this wallet)" % [TAG, wallet_name])
+		status_updated.emit("Confirm deletion in %s..." % wallet_name)
+		var approved := await _confirm_delete_via_throwaway_tx()
+		if not approved:
+			print("%s delete_account | %s confirmation rejected or failed — cancelling delete" % [TAG, wallet_name])
+			status_updated.emit("Delete cancelled — confirmation required")
 			return
-		print("%s delete_account | confirmed via Solflare connect_wallet()" % TAG)
+		print("%s delete_account | confirmed via %s sign_transaction (no broadcast)" % [TAG, wallet_name])
 	else:
 		# All other wallets: sign_text_message for confirmation
 		print("%s delete_account | requesting confirmation via sign_message" % TAG)
@@ -873,6 +894,167 @@ func delete_account() -> void:
 	print("%s delete_account | DONE cache cleared, session destroyed" % TAG)
 	AndroidToastHelper.show("Account deleted, cache cleared", true)
 	status_updated.emit("Account deleted — all cached data cleared")
+
+
+## ─── BACKPACK SIGN+RPC HELPER (sign_and_send workaround) ────────────────────
+##
+## Reconstruct each raw tx into a Godot Transaction node, sign it via the
+## attached WalletAdapter (which issues an MWA sign_transactions to the wallet —
+## Backpack implements this correctly), then broadcast via Transaction.send()
+## which POSTs to the Solana JSON-RPC endpoint configured in url_override.
+## Same pattern as Godot SDK's own `example/WalletAdapterAndroid/wallet_adapter_android.gd`.
+##
+## One wallet intent, one user approval — identical UX to the native
+## sign_and_send path, without hitting Backpack's Kotlin crash.
+##
+## Returns an array of base58 signature strings (one per successful tx).
+func _sign_and_broadcast_via_rpc(transactions: Array) -> Array:
+	print("%s _sign_and_broadcast_via_rpc | START tx_count=%d (Backpack workaround path)" % [TAG, transactions.size()])
+	status_updated.emit("Signing and sending %d transaction(s)..." % transactions.size())
+
+	var signatures: Array = []
+	for i in range(transactions.size()):
+		var tx_bytes: PackedByteArray = transactions[i]
+		print("%s _sign_and_broadcast_via_rpc | tx %d/%d tx_bytes=%d — reconstructing Transaction node" % [TAG, i + 1, transactions.size(), tx_bytes.size()])
+
+		var tx: Transaction = Transaction.new_from_bytes(tx_bytes)
+		add_child(tx)
+		tx.set_signers([wallet_adapter])
+		tx.url_override = AppConfig.get_rpc_url()
+		print("%s _sign_and_broadcast_via_rpc | tx %d signers set url_override=%s calling tx.sign()" % [TAG, i + 1, tx.url_override])
+
+		status_updated.emit("Approve tx %d/%d in Backpack..." % [i + 1, transactions.size()])
+		tx.sign()
+		await tx.fully_signed
+		print("%s _sign_and_broadcast_via_rpc | tx %d fully_signed — calling tx.send() to broadcast via RPC" % [TAG, i + 1])
+
+		status_updated.emit("Broadcasting tx %d/%d..." % [i + 1, transactions.size()])
+		tx.send()
+		var response: Dictionary = await tx.transaction_response_received
+		print("%s _sign_and_broadcast_via_rpc | tx %d response_received keys=%s" % [TAG, i + 1, str(response.keys())])
+
+		if response.has("result"):
+			var sig_str := str(response["result"])
+			print("%s _sign_and_broadcast_via_rpc | tx %d SUCCESS sig=%s" % [TAG, i + 1, sig_str.substr(0, 40)])
+			signatures.append(sig_str)
+		elif response.has("error"):
+			var err_str := str(response["error"])
+			print("%s _sign_and_broadcast_via_rpc | tx %d RPC_ERROR %s" % [TAG, i + 1, err_str.substr(0, 200)])
+			# Detect InsufficientFundsForRent so home.gd can show a specific toast
+			# instead of a generic "send failed". See KNOWN_ISSUES.md.
+			if err_str.find("InsufficientFundsForRent") >= 0 or err_str.findn("insufficient funds for rent") >= 0:
+				last_error_code = "INSUFFICIENT_FUNDS_FOR_RENT"
+			else:
+				last_error_code = "RPC_BROADCAST_FAILED"
+		else:
+			print("%s _sign_and_broadcast_via_rpc | tx %d UNEXPECTED response=%s" % [TAG, i + 1, str(response).substr(0, 200)])
+
+		tx.queue_free()
+
+	print("%s _sign_and_broadcast_via_rpc | DONE sent=%d/%d" % [TAG, signatures.size(), transactions.size()])
+	if signatures.size() > 0:
+		AndroidToastHelper.show("Sent %d transaction(s)" % signatures.size(), true)
+		status_updated.emit("Sent! Sig: %s..." % str(signatures[0]).substr(0, 20))
+	elif last_error_code == "INSUFFICIENT_FUNDS_FOR_RENT":
+		status_updated.emit("Fee-payer underfunded — send ≥0.001 SOL and retry")
+	else:
+		status_updated.emit("Sign & send failed")
+	transactions_sent.emit(signatures)
+	return signatures
+
+
+## ─── FETCH BALANCE via JSON-RPC getBalance ──────────────────────────────────
+##
+## Raw HTTPRequest-based balance fetch so we can short-circuit Sign & Send
+## before opening the wallet intent when the fee-payer can't cover Solana's
+## rent-exempt minimum + fees. Avoids a dependency on the Godot SDK's
+## SolanaClient node in a path that runs from a non-scene singleton.
+## Returns lamports as int, or -1 on any error.
+func _fetch_balance_lamports(pubkey: String) -> int:
+	var url := AppConfig.get_rpc_url()
+	var req := HTTPRequest.new()
+	add_child(req)
+	var body := JSON.stringify({
+		"jsonrpc": "2.0",
+		"id": 1,
+		"method": "getBalance",
+		"params": [pubkey],
+	})
+	var headers := ["Content-Type: application/json"]
+	var err := req.request(url, headers, HTTPClient.METHOD_POST, body)
+	if err != OK:
+		print("%s _fetch_balance_lamports | HTTP_REQUEST_FAIL err=%d" % [TAG, err])
+		req.queue_free()
+		return -1
+	var resp = await req.request_completed
+	req.queue_free()
+	# resp = [result_code, http_code, headers, body_bytes]
+	if resp.size() < 4:
+		print("%s _fetch_balance_lamports | MALFORMED_RESPONSE size=%d" % [TAG, resp.size()])
+		return -1
+	var http_code: int = resp[1]
+	if http_code != 200:
+		print("%s _fetch_balance_lamports | HTTP_STATUS http_code=%d" % [TAG, http_code])
+		return -1
+	var body_str: String = (resp[3] as PackedByteArray).get_string_from_utf8()
+	var parsed = JSON.parse_string(body_str)
+	if parsed == null or typeof(parsed) != TYPE_DICTIONARY:
+		print("%s _fetch_balance_lamports | PARSE_FAIL body=%s" % [TAG, body_str.substr(0, 200)])
+		return -1
+	if parsed.has("error"):
+		print("%s _fetch_balance_lamports | RPC_ERROR %s" % [TAG, str(parsed["error"]).substr(0, 200)])
+		return -1
+	if not parsed.has("result") or typeof(parsed["result"]) != TYPE_DICTIONARY:
+		return -1
+	var result: Dictionary = parsed["result"]
+	if not result.has("value"):
+		return -1
+	var lamports := int(result["value"])
+	print("%s _fetch_balance_lamports | SUCCESS pubkey=%s lamports=%d" % [TAG, pubkey, lamports])
+	return lamports
+
+
+## ─── THROWAWAY-TX DELETE GATE (Phantom + Solflare) ──────────────────────────
+##
+## Build a minimal 0-lamport self-transfer, fetch a blockhash, and ask the
+## wallet to sign it via `sign_transaction`. The signature proves user consent.
+## The signed tx is NEVER broadcast — the blockhash will harmlessly expire.
+## No lamports spent, no on-chain effect. Used ONLY by Phantom/Solflare delete
+## flows because those wallets don't implement `sign_messages` over MWA.
+##
+## Returns true if the wallet returned a non-empty signature, false otherwise
+## (user rejected, wallet timed out, blockhash fetch failed, etc.).
+func _confirm_delete_via_throwaway_tx() -> bool:
+	print("%s _confirm_delete_via_throwaway_tx | START pubkey=%s" % [TAG, connected_pubkey])
+
+	if connected_pubkey.is_empty():
+		print("%s _confirm_delete_via_throwaway_tx | FAIL connected_pubkey empty" % TAG)
+		return false
+
+	var payer = Pubkey.new_from_string(connected_pubkey)
+	var ix = SystemProgram.transfer(payer, payer, 0)
+	var tx := Transaction.new()
+	add_child(tx)
+	tx.set_payer(payer)
+	tx.add_instruction(ix)
+	tx.url_override = AppConfig.get_rpc_url()
+	print("%s _confirm_delete_via_throwaway_tx | tx built — fetching blockhash url=%s" % [TAG, tx.url_override])
+
+	tx.update_latest_blockhash()
+	var bh_result: Dictionary = await tx.blockhash_updated
+	if not bh_result.has("result"):
+		print("%s _confirm_delete_via_throwaway_tx | FAIL blockhash fetch failed bh_result=%s" % [TAG, str(bh_result).substr(0, 200)])
+		tx.queue_free()
+		return false
+
+	var tx_bytes: PackedByteArray = tx.serialize()
+	print("%s _confirm_delete_via_throwaway_tx | serialized tx_bytes=%d — calling sign_transaction (NOT broadcast)" % [TAG, tx_bytes.size()])
+	tx.queue_free()
+
+	var sig := await sign_transaction(tx_bytes)
+	var approved := not sig.is_empty()
+	print("%s _confirm_delete_via_throwaway_tx | RESULT approved=%s sig_len=%d (no broadcast attempted by design)" % [TAG, str(approved), sig.length()])
+	return approved
 
 
 ## ─── HELPERS ─────────────────────────────────────────────────────────────────
